@@ -395,19 +395,30 @@ class TensorRTRefitLoader:
 
         # --- Step 1: Extract LoRA-patched weights from source model ---
         trt_logger.info("Refit: loading source model to extract weights...")
-        comfy.model_management.load_models_gpu(
-            [source_model], force_patch_weights=True, force_full_load=True
-        )
-        src_sd = source_model.model.diffusion_model.state_dict()
-        # Copy to CPU numpy immediately so we can free GPU for the TRT engine.
-        # Use float16 to match the ONNX export precision.
+        comfy.model_management.load_models_gpu([source_model])
+
+        # Use patch_weight_to_device to compute patched weights without
+        # force_patch_weights (incompatible with ModelPatcherDynamic).
         weight_dtype = torch.float16
         if model_type in ("flux_dev", "flux_schnell"):
             weight_dtype = torch.bfloat16
+
+        diffusion_prefix = "diffusion_model."
         cpu_weights = {}
-        for k in list(src_sd.keys()):
-            cpu_weights[k] = src_sd.pop(k).to(dtype=weight_dtype).cpu().numpy()
-        del src_sd
+        for key in list(source_model.patches.keys()):
+            if key.startswith(diffusion_prefix):
+                w = source_model.patch_weight_to_device(key, return_weight=True)
+                if w is not None:
+                    short_key = key[len(diffusion_prefix) :]
+                    cpu_weights[short_key] = w.to(dtype=weight_dtype).cpu().numpy()
+
+        # Also grab base (unpatched) weights for any diffusion_model keys
+        # not covered by patches — TRT refit needs the full weight set.
+        base_sd = source_model.model.diffusion_model.state_dict()
+        for k in list(base_sd.keys()):
+            if k not in cpu_weights:
+                cpu_weights[k] = base_sd.pop(k).to(dtype=weight_dtype).cpu().numpy()
+        del base_sd
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
 
