@@ -3,7 +3,47 @@
 This node enables the best performance on NVIDIA RTX™ Graphics Cards
  (GPUs) for Stable Diffusion by leveraging NVIDIA TensorRT.
 
-Supports:
+## Fork Changes
+
+This fork fixes compatibility with modern ComfyUI and adds LoRA support via TensorRT's Refitter API.
+
+### 1. ONNX Export Compatibility
+
+Fixes ONNX export failure on modern ComfyUI. Disables `comfy_cast_weights` during tracing (its `.view(dtype=...)` produces unsupported ops), handles `ModelPatcherDynamic` by skipping `force_patch_weights`, and ensures all weights are on GPU before export.
+
+### 2. Step Size Reduction
+
+Reduces height/width input step from 64 to 16 for finer-grained resolution control over TRT engine profile shapes.
+
+### 3. Lazy Engine Load + VRAM Reporting
+
+Defers TRT engine deserialization to first use and reports true VRAM cost (weights + context scratch) to ComfyUI's memory manager. Previously only context memory (~50 MB) was reported, causing ComfyUI to freely evict and reload multi-GB engines between XY plot iterations.
+
+### 4. LoRA Refit
+
+Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap LoRA weights (any combination, any strength) into a pre-built TRT engine in seconds instead of rebuilding from scratch (minutes). See **[REFIT.md](REFIT.md)** for setup steps, usage guide, and FAQ.
+
+### WIP
+
+- **VAE TensorRT** — TRT-accelerated SDXL VAE decode. Implemented separately, to be refactored into this repo.
+- **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
+
+### Shelved
+
+- **WAN 2.2 VAE** — VAE is not viable for TRT (temporal caching is inherently sequential).
+
+  <small>The developing LLM agent, Opus 4.5, managed to implement a working VAE decode for WAN. VAE encode is allegedly entirely incompatible with TRT. Only after attempting the implementation of both did I manage to inform the agent they had a gap in their reasoning. We implemented VAE decode, but it's inherently only possible to implement TRT for it that is less efficient than default. `"Way she goes." Or something like that.`</small>
+
+### TODO
+
+- **Refit persistence** — serialize refitted engine to RAM or disk, avoiding re-refit after VRAM eviction
+
+</br>
+</br>
+
+---
+
+## Supports
 
 - Stable Diffusion 1.5
 - Stable Diffusion 2.1
@@ -15,7 +55,7 @@ Supports:
 - AuraFlow
 - Flux
 
-Requirements:
+## Requirements
 
 - GeForce RTX™ or NVIDIA RTX™ GPU
 - For SDXL and SDXL Turbo, a GPU with 12 GB or more VRAM is recommended
@@ -102,7 +142,7 @@ much faster. Generating engines can take anywhere from 3-10 minutes for
 the image generation models and 10-25 minutes for SVD. SVD-XT is an
 extremely extensive model - engine build times may take up to an hour.
 
-------------------------------------------------------------------------
+---
 
 ### Accelerated Image Generation Using a TensorRT Engine
 
@@ -112,8 +152,9 @@ TensorRT Engines are loaded using the TensorRT Loader node.
 
 ## Common Issues/Limitations
 
-ComfyUI TensorRT engines are not yet compatible with ControlNets or
-LoRAs. Compatibility will be enabled in a future update.
+ComfyUI TensorRT engines are not yet compatible with ControlNets.
+LoRA support is available via the `TensorRT Refit Loader` node (see
+[Fork Changes](#fork-changes) above).
 
 1.  Add a TensorRT Loader node
 2.  Note, if a TensorRT Engine has been created during a ComfyUI
