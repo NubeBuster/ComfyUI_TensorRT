@@ -25,23 +25,23 @@ Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap LoRA wei
 
 ### WIP
 
+### And then?
+
+#### WIP
+
+- **Better UX Nodes** — The current building and loading is not very user friendly. Wouldn't it be nice to have a loader node with widgets that allow you to define you want the model requested for loading to be built if not present, provided you define the parameters for the build? Wouldn't it be nice if the Refit feature was decorated with the ability to just change the LoRA settings in the external load and have this repo do the dirty work?
 - **VAE TensorRT** — TRT-accelerated SDXL VAE decode. Implemented separately, to be refactored into this repo.
 - **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
 
-### Shelved
+#### Shelved
 
 - **WAN 2.2 VAE** — VAE is not viable for TRT (temporal caching is inherently sequential).
 
   <small>The developing LLM agent, Opus 4.5, managed to implement a working VAE decode for WAN. VAE encode is allegedly entirely incompatible with TRT. Only after attempting the implementation of both did I manage to inform the agent they had a gap in their reasoning. We implemented VAE decode, but it's inherently only possible to implement TRT for it that is less efficient than default. `"Way she goes." Or something like that.`</small>
 
-### TODO
+#### TODO
 
 - **Refit persistence** — serialize refitted engine to RAM or disk, avoiding re-refit after VRAM eviction
-
-</br>
-</br>
-
----
 
 ## Supports
 
@@ -75,9 +75,21 @@ You can also manually install them by git cloning the repo to your ComfyUI/custo
 
 ```
 cd custom_nodes
-git clone https://github.com/comfyanonymous/ComfyUI_TensorRT
+git clone https://github.com/NubeBuster/ComfyUI_TensorRT
 cd ComfyUI_TensorRT
 pip install -r requirements.txt
+```
+
+### Upgrading from upstream
+
+If you already have the original `comfyanonymous/ComfyUI_TensorRT` installed:
+
+```
+cd custom_nodes/ComfyUI_TensorRT
+git remote rename origin upstream
+git remote add origin https://github.com/NubeBuster/ComfyUI_TensorRT
+git fetch origin
+git reset --hard origin/master
 ```
 
 ## Description
