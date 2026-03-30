@@ -76,6 +76,11 @@ class TrTEngine:
         """Deserialize engine and create execution context."""
         if self.engine is not None:
             return
+        if self.engine_path is None:
+            raise RuntimeError(
+                "Cannot reload a refitted TRT engine — it exists only in memory. "
+                "Re-run the refit node to recreate it."
+            )
         trt_logger.info(f"TRT loading engine: {self.engine_path}")
         with open(self.engine_path, "rb") as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
@@ -332,8 +337,15 @@ def _wrap_trt_patcher(model, unet):
     def _on_detach(p, _unpatch_all):
         pass
 
+    def _on_cleanup(p):
+        eng = p.model.diffusion_model
+        if eng.engine_path is not None:
+            eng._unload()
+            p.model.model_loaded_weight_memory = 0
+
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach)
+    patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_CLEANUP, _on_cleanup)
 
     trt_logger.info(
         f"TRT UNet registered with ComfyUI memory manager "
@@ -403,21 +415,68 @@ class TensorRTRefitLoader:
         if model_type in ("flux_dev", "flux_schnell"):
             weight_dtype = torch.bfloat16
 
+        patcher_type = type(source_model).__name__
+        trt_logger.info(
+            f"Refit: source patcher type={patcher_type}, "
+            f"patches={len(source_model.patches)}, "
+            f"weight_dtype={weight_dtype}"
+        )
+
+        # Get base weights first for delta comparison
+        base_sd = source_model.model.diffusion_model.state_dict()
+        trt_logger.info(f"Refit: base state_dict has {len(base_sd)} keys")
+
         diffusion_prefix = "diffusion_model."
         cpu_weights = {}
+        patched_count = 0
+        skipped_none = 0
+        skipped_noprefix = 0
+        delta_nonzero = 0
         for key in list(source_model.patches.keys()):
-            if key.startswith(diffusion_prefix):
-                w = source_model.patch_weight_to_device(key, return_weight=True)
-                if w is not None:
-                    short_key = key[len(diffusion_prefix) :]
-                    cpu_weights[short_key] = w.to(dtype=weight_dtype).cpu().numpy()
+            if not key.startswith(diffusion_prefix):
+                skipped_noprefix += 1
+                continue
+            w = source_model.patch_weight_to_device(key, return_weight=True)
+            if w is None:
+                skipped_none += 1
+                trt_logger.warning(
+                    f"Refit: patch_weight_to_device returned None for {key}"
+                )
+                continue
+            short_key = key[len(diffusion_prefix) :]
+            # Check if patched weight differs from base
+            if short_key in base_sd:
+                base_w = base_sd[short_key].to(dtype=w.dtype, device=w.device)
+                diff = (w - base_w).abs().max().item()
+                if diff > 1e-6:
+                    delta_nonzero += 1
+                    if delta_nonzero <= 3:
+                        trt_logger.info(
+                            f"Refit: LoRA delta sample: {short_key} "
+                            f"max_diff={diff:.6f}, shape={list(w.shape)}"
+                        )
+            cpu_weights[short_key] = w.to(dtype=weight_dtype).cpu().numpy()
+            patched_count += 1
 
-        # Also grab base (unpatched) weights for any diffusion_model keys
-        # not covered by patches — TRT refit needs the full weight set.
-        base_sd = source_model.model.diffusion_model.state_dict()
+        trt_logger.info(
+            f"Refit: {patched_count} patched weights extracted, "
+            f"{delta_nonzero} differ from base, "
+            f"{skipped_none} returned None, "
+            f"{skipped_noprefix} skipped (non-diffusion)"
+        )
+
+        # Track which keys had LoRA patches applied
+        patched_keys = set(cpu_weights.keys())
+
+        # Fill in base (unpatched) weights for keys not covered by patches.
+        base_count = 0
         for k in list(base_sd.keys()):
             if k not in cpu_weights:
                 cpu_weights[k] = base_sd.pop(k).to(dtype=weight_dtype).cpu().numpy()
+                base_count += 1
+        trt_logger.info(
+            f"Refit: {base_count} base weights added (total: {len(cpu_weights)})"
+        )
         del base_sd
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
@@ -439,6 +498,11 @@ class TensorRTRefitLoader:
         refitter = trt.Refitter(engine, logger)
 
         trt_weight_names = set(refitter.get_all_weights())
+        # Log TRT weight name samples for debugging key mapping
+        trt_samples = sorted(trt_weight_names)[:10]
+        trt_logger.info(
+            f"Refit: TRT has {len(trt_weight_names)} weights, samples: {trt_samples}"
+        )
         if not trt_weight_names:
             del refitter, engine
             raise RuntimeError(
@@ -446,6 +510,8 @@ class TensorRTRefitLoader:
             )
 
         matched = 0
+        matched_patched = 0
+        matched_base = 0
         missing_in_trt = 0
         for trt_name in trt_weight_names:
             # TRT weight names have "unet." prefix from the ONNX export wrapper
@@ -464,6 +530,32 @@ class TensorRTRefitLoader:
 
             refitter.set_named_weights(trt_name, trt.Weights(cpu_weights[pytorch_key]))
             matched += 1
+            if pytorch_key in patched_keys:
+                matched_patched += 1
+            else:
+                matched_base += 1
+
+        # Log patched keys that did NOT match any TRT weight
+        trt_keys_stripped = {
+            (n[len("unet.") :] if n.startswith("unet.") else n)
+            for n in trt_weight_names
+        }
+        patched_not_mapped = patched_keys - trt_keys_stripped
+        if patched_not_mapped:
+            samples = sorted(patched_not_mapped)[:5]
+            trt_logger.warning(
+                f"Refit: {len(patched_not_mapped)} LoRA-patched weights NOT "
+                f"mapped to any TRT weight: {samples}"
+                f"{'...' if len(patched_not_mapped) > 5 else ''}"
+            )
+            # Find near-matches for first unmapped key to diagnose naming
+            first_unmapped = sorted(patched_not_mapped)[0]
+            # Search for TRT weights containing the same leaf name
+            leaf = first_unmapped.rsplit(".", 1)[0]  # e.g. "input_blocks.4.1.proj_in"
+            near = [n for n in sorted(trt_weight_names) if leaf in n][:5]
+            trt_logger.info(
+                f"Refit: near-matches in TRT for '{first_unmapped}': {near}"
+            )
 
         missing = refitter.get_missing_weights()
         if missing:
@@ -473,7 +565,8 @@ class TensorRTRefitLoader:
             )
 
         trt_logger.info(
-            f"Refit: {matched} weights mapped, "
+            f"Refit: {matched} weights mapped "
+            f"({matched_patched} LoRA-patched, {matched_base} base), "
             f"{missing_in_trt} TRT weights without source match, "
             f"{len(missing)} still missing"
         )
@@ -659,12 +752,22 @@ class TrtVAE:
             p.model.model_loaded_weight_memory = trt_mem
 
         def _on_detach(p, _unpatch_all):
-            # Keep engines hot — same rationale as TrTUnet
+            # Keep engines hot — avoid reload thrash during XY plots
             pass
+
+        def _on_cleanup(p):
+            if decode_eng:
+                decode_eng._unload()
+            if encode_eng:
+                encode_eng._unload()
+            p.model.model_loaded_weight_memory = 0
 
         self.patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
         self.patcher.add_callback(
             comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach
+        )
+        self.patcher.add_callback(
+            comfy.patcher_extension.CallbacksMP.ON_CLEANUP, _on_cleanup
         )
 
         trt_logger.info(

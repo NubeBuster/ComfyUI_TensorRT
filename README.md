@@ -21,7 +21,9 @@ Defers TRT engine deserialization to first use and reports true VRAM cost (weigh
 
 ### 4. LoRA Refit
 
-Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap LoRA weights (any combination, any strength) into a pre-built TRT engine in seconds instead of rebuilding from scratch (minutes). See **[REFIT.md](REFIT.md)** for setup steps, usage guide, and FAQ.
+Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap LoRA weights into a pre-built TRT engine in seconds instead of rebuilding from scratch (minutes). See **[REFIT.md](REFIT.md)** for setup steps, usage guide, and FAQ.
+
+**Known limitation (TRT 10.4):** TRT fuses attention layers (QKV projections, linear projections) during engine build. Only ~66/788 LoRA-targeted weights map to individually refittable TRT weights — the rest are in fused layers with internal names. `REFIT_INDIVIDUAL` (which should prevent fusion) is defined in TRT 10.4 but broken (produces engines with 0 refittable weights). Full LoRA refit coverage requires a future TRT release that fixes this flag.
 
 ### 5. VAE TensorRT
 
@@ -32,8 +34,8 @@ TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL)
 
 ### 6. Smart Engine Organization
 
-- **Auto-pathing** — VAE engines default to `output/tensorrt/vae/` without requiring a path in the filename prefix.
-- **`{modelname}` placeholder** — Filename prefix supports `{modelname}` which resolves to the source model's name (from the connected checkpoint/VAE loader).
+- **Auto-pathing** — UNet engines default to `output/tensorrt/unet/`, VAE engines to `output/tensorrt/vae/`, without requiring a path in the filename prefix.
+- **`{modelname}` placeholder** — Filename prefix supports `{modelname}` which resolves to the source model's name (from the connected checkpoint/VAE loader). Works on both UNet and VAE builders.
 - **Filtered dropdowns** — UNet loaders only show UNet engines, VAE loader only shows VAE engine pairs, Refit loader only shows refit-enabled engines.
 - **Node descriptions & tooltips** — All nodes have DESCRIPTION attributes and widget tooltips explaining their purpose and options.
 
@@ -52,7 +54,7 @@ TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL)
   - [x] ~~VAE loader auto-discovers paired decode/encode engines (single dropdown)~~
   - [x] ~~UNet/VAE/Refit engine dropdowns filtered~~
   - [x] ~~DESCRIPTION docstrings and widget tooltips on all nodes~~
-  - [x] ~~`{modelname}` placeholder and auto-pathing for VAE builders~~
+  - [x] ~~`{modelname}` placeholder and auto-pathing for UNet and VAE builders~~
   - [ ] Merged builder + loader for UNet — auto-build engine if not present, with build parameters on the loader node. Maybe split off predetermined build approval or rejection config to a TensorRT Build Config node?
 - [ ] **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
 
