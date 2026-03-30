@@ -911,7 +911,7 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         return {
             "required": {
                 "vae": ("VAE",),
-                "operation": (["decode", "encode"],),
+                "operation": (["decode + encode", "decode", "encode"],),
                 "filename_prefix": ("STRING", {"default": "tensorrt/ComfyUI_VAE_DYN"}),
                 "height_min": (
                     "INT",
@@ -952,18 +952,21 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         width_opt,
         width_max,
     ):
-        return self._convert_vae(
-            vae,
-            filename_prefix,
-            operation,
-            height_min,
-            height_opt,
-            height_max,
-            width_min,
-            width_opt,
-            width_max,
-            is_static=False,
-        )
+        ops = ["decode", "encode"] if operation == "decode + encode" else [operation]
+        for op in ops:
+            self._convert_vae(
+                vae,
+                filename_prefix,
+                op,
+                height_min,
+                height_opt,
+                height_max,
+                width_min,
+                width_opt,
+                width_max,
+                is_static=False,
+            )
+        return ()
 
 
 class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
@@ -975,7 +978,7 @@ class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         return {
             "required": {
                 "vae": ("VAE",),
-                "operation": (["decode", "encode"],),
+                "operation": (["decode + encode", "decode", "encode"],),
                 "filename_prefix": (
                     "STRING",
                     {"default": "tensorrt/ComfyUI_VAE_STAT"},
@@ -992,18 +995,21 @@ class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         }
 
     def convert(self, vae, operation, filename_prefix, height_opt, width_opt):
-        return self._convert_vae(
-            vae,
-            filename_prefix,
-            operation,
-            height_opt,
-            height_opt,
-            height_opt,
-            width_opt,
-            width_opt,
-            width_opt,
-            is_static=True,
-        )
+        ops = ["decode", "encode"] if operation == "decode + encode" else [operation]
+        for op in ops:
+            self._convert_vae(
+                vae,
+                filename_prefix,
+                op,
+                height_opt,
+                height_opt,
+                height_opt,
+                width_opt,
+                width_opt,
+                width_opt,
+                is_static=True,
+            )
+        return ()
 
 
 NODE_CLASS_MAPPINGS = {

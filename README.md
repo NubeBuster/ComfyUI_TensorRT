@@ -34,8 +34,13 @@ TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL)
 
 #### WIP
 
-- [ ] **Better UX Nodes** — The current building and loading is not very user friendly. Wouldn't it be nice to have a loader node with widgets that allow you to define you want the model requested for loading to be built if not present, provided you define the parameters for the build? Wouldn't it be nice if the Refit feature was decorated with the ability to just change the LoRA settings in the external load and have this repo do the dirty work?
 - [x] ~~**VAE TensorRT** — TRT-accelerated SDXL VAE decode. Implemented separately, to be refactored into this repo.~~
+- [ ] **Better UX Nodes** — Streamlined building and loading experience.
+  - [x] ~~VAE builder builds decode + encode in one run (default)~~
+  - [x] ~~VAE loader auto-discovers paired decode/encode engines (single dropdown)~~
+  - [x] ~~UNet/VAE engine dropdowns filtered — UNet loaders exclude VAE engines and vice versa~~
+  - [ ] Add DESCRIPTION docstrings and widget tooltips to all nodes
+  - [ ] Merged builder + loader for UNet — auto-build engine if not present, with build parameters on the loader node. Maybe split off predetermined build approval or rejection config to a TensorRT Build Config node?
 - [ ] **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
 
 #### TODO

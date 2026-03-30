@@ -1,5 +1,6 @@
 # Put this in the custom_nodes folder, put your tensorrt engine files in ComfyUI/models/tensorrt/ (you will have to create the directory)
 
+import re
 import torch
 import os
 
@@ -205,7 +206,7 @@ class TensorRTLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("tensorrt"),),
+                "unet_name": (_list_unet_engines(),),
                 "model_type": (
                     [
                         "sdxl_base",
@@ -420,7 +421,7 @@ class TensorRTRefitLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("tensorrt"),),
+                "unet_name": (_list_unet_engines(),),
                 "model_type": (MODEL_TYPE_LIST,),
                 "source_model": ("MODEL",),
             },
@@ -531,6 +532,60 @@ class TensorRTRefitLoader:
 
 
 # --- VAE TRT Loading ---
+
+# Pattern to strip _decode_ or _encode_ and everything after to get a base key
+# e.g. "ComfyUI_VAE_STAT_decode_$stat-h-1024-w-1024_00001_.engine"
+#   -> base key "ComfyUI_VAE_STAT_$stat-h-1024-w-1024_00001_"
+_ENGINE_OP_RE = re.compile(r"_(decode|encode)_")
+_vae_engine_set_map = {}
+
+
+def _list_unet_engines():
+    """List TRT engine files, excluding VAE engines (decode/encode)."""
+    return [
+        f
+        for f in folder_paths.get_filename_list("tensorrt")
+        if not _ENGINE_OP_RE.search(f)
+    ]
+
+
+def _list_vae_engine_sets():
+    """Discover VAE engine sets by grouping decode/encode pairs by base key.
+
+    Returns a list of display keys for the dropdown. Each key maps to
+    a pair of engine filenames (decode + optional encode).
+    """
+    global _vae_engine_set_map
+    _vae_engine_set_map = {}
+
+    engines = folder_paths.get_filename_list("tensorrt")
+    groups = {}  # base_key -> {"decode": filename, "encode": filename}
+    for f in sorted(engines):
+        if not f.endswith(".engine"):
+            continue
+        stem = f[: -len(".engine")]
+        match = _ENGINE_OP_RE.search(stem)
+        if not match:
+            continue
+        operation = match.group(1)
+        # Remove _decode or _encode, keep the trailing _
+        base_key = stem[: match.start()] + stem[match.end() - 1 :]
+        if base_key not in groups:
+            groups[base_key] = {}
+        groups[base_key][operation] = f
+
+    if not groups:
+        return ["(no VAE engines found)"]
+
+    keys = []
+    for base_key in sorted(groups):
+        group = groups[base_key]
+        if "decode" not in group:
+            continue  # Need at least decode
+        _vae_engine_set_map[base_key] = group
+        keys.append(base_key)
+
+    return keys if keys else ["(no VAE engines found)"]
 
 
 class TrTVae:
@@ -711,11 +766,9 @@ class TrtVAE:
 class TensorRTVAELoader:
     @classmethod
     def INPUT_TYPES(s):
-        engines = folder_paths.get_filename_list("tensorrt")
         return {
             "required": {
-                "decode_engine": (engines,),
-                "encode_engine": (["(none)"] + list(engines),),
+                "engine": (_list_vae_engine_sets(),),
             },
         }
 
@@ -723,14 +776,27 @@ class TensorRTVAELoader:
     FUNCTION = "load_vae"
     CATEGORY = "TensorRT"
 
-    def load_vae(self, decode_engine, encode_engine="(none)"):
-        dec_path = folder_paths.get_full_path("tensorrt", decode_engine)
+    def load_vae(self, engine):
+        if engine == "(no VAE engines found)":
+            raise ValueError(
+                "No VAE TRT engines found. Build them first with a "
+                "VAE TRT Conversion node."
+            )
+
+        engine_set = _vae_engine_set_map.get(engine)
+        if not engine_set:
+            raise ValueError(f"Engine set '{engine}' not found. Refresh the page.")
+
+        dec_file = engine_set["decode"]
+        enc_file = engine_set.get("encode")
+
+        dec_path = folder_paths.get_full_path("tensorrt", dec_file)
         if not os.path.isfile(dec_path):
             raise FileNotFoundError(f"Decode engine not found: {dec_path}")
 
         enc_path = None
-        if encode_engine and encode_engine != "(none)":
-            enc_path = folder_paths.get_full_path("tensorrt", encode_engine)
+        if enc_file:
+            enc_path = folder_paths.get_full_path("tensorrt", enc_file)
             if not os.path.isfile(enc_path):
                 raise FileNotFoundError(f"Encode engine not found: {enc_path}")
 
