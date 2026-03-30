@@ -1,5 +1,4 @@
 import torch
-import sys
 import os
 import time
 import comfy.model_management
@@ -22,6 +21,7 @@ else:
         [os.path.join(folder_paths.get_output_directory(), "tensorrt")],
         {".engine"},
     )
+
 
 class TQDMProgressMonitor(trt.IProgressMonitor):
     def __init__(self):
@@ -92,14 +92,18 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
         except KeyboardInterrupt:
             # There is no need to propagate this exception to TensorRT. We can simply cancel the build.
             return False
-        
+
 
 class TRT_MODEL_CONVERSION_BASE:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
         self.temp_dir = folder_paths.get_temp_directory()
         self.timing_cache_path = os.path.normpath(
-            os.path.join(os.path.join(os.path.dirname(os.path.realpath(__file__)), "timing_cache.trt"))
+            os.path.join(
+                os.path.join(
+                    os.path.dirname(os.path.realpath(__file__)), "timing_cache.trt"
+                )
+            )
         )
 
     RETURN_TYPES = ()
@@ -155,8 +159,15 @@ class TRT_MODEL_CONVERSION_BASE:
         )
 
         comfy.model_management.unload_all_models()
-        comfy.model_management.load_models_gpu([model], force_patch_weights=True, force_full_load=True)
+        force_patch = not isinstance(model, comfy.model_patcher.ModelPatcherDynamic)
+        comfy.model_management.load_models_gpu(
+            [model], force_patch_weights=force_patch, force_full_load=True
+        )
         unet = model.model.diffusion_model
+        # Ensure all weights are on GPU for ONNX tracing (Dynamic patcher
+        # may leave weights on CPU when force_patch_weights is False)
+        device = comfy.model_management.get_torch_device()
+        unet.to(device)
 
         context_dim = model.model.model_config.unet_config.get("context_dim", None)
         context_len = 77
@@ -165,17 +176,23 @@ class TRT_MODEL_CONVERSION_BASE:
         extra_input = {}
         dtype = torch.float16
 
-        if isinstance(model.model, comfy.model_base.SD3): #SD3
-            context_embedder_config = model.model.model_config.unet_config.get("context_embedder_config", None)
+        if isinstance(model.model, comfy.model_base.SD3):  # SD3
+            context_embedder_config = model.model.model_config.unet_config.get(
+                "context_embedder_config", None
+            )
             if context_embedder_config is not None:
-                context_dim = context_embedder_config.get("params", {}).get("in_features", None)
-                context_len = 154 #NOTE: SD3 can have 77 or 154 depending on which text encoders are used, this is why context_len_min stays 77
+                context_dim = context_embedder_config.get("params", {}).get(
+                    "in_features", None
+                )
+                context_len = 154  # NOTE: SD3 can have 77 or 154 depending on which text encoders are used, this is why context_len_min stays 77
         elif isinstance(model.model, comfy.model_base.AuraFlow):
             context_dim = 2048
             context_len_min = 256
             context_len = 256
         elif isinstance(model.model, comfy.model_base.Flux):
-            context_dim = model.model.model_config.unet_config.get("context_in_dim", None)
+            context_dim = model.model.model_config.unet_config.get(
+                "context_in_dim", None
+            )
             context_len_min = 256
             context_len = 256
             y_dim = model.model.model_config.unet_config.get("vec_in_dim", None)
@@ -192,7 +209,7 @@ class TRT_MODEL_CONVERSION_BASE:
                 "context": {0: "batch", 1: "num_embeds"},
             }
 
-            transformer_options = model.model_options['transformer_options'].copy()
+            transformer_options = model.model_options["transformer_options"].copy()
             if model.model.model_config.unet_config.get(
                 "use_temporal_resblock", False
             ):  # SVD
@@ -218,13 +235,20 @@ class TRT_MODEL_CONVERSION_BASE:
                 unet = svd_unet
                 context_len_min = context_len = 1
             else:
+
                 class UNET(torch.nn.Module):
                     def forward(self, x, timesteps, context, *args):
                         extras = input_names[3:]
                         extra_args = {}
                         for i in range(len(extras)):
                             extra_args[extras[i]] = args[i]
-                        return self.unet(x, timesteps, context, transformer_options=self.transformer_options, **extra_args)
+                        return self.unet(
+                            x,
+                            timesteps,
+                            context,
+                            transformer_options=self.transformer_options,
+                            **extra_args,
+                        )
 
                 _unet = UNET()
                 _unet.unet = unet
@@ -263,7 +287,6 @@ class TRT_MODEL_CONVERSION_BASE:
                 inputs_shapes_opt += ((batch_size_opt,) + extra_input[k],)
                 inputs_shapes_max += ((batch_size_max,) + extra_input[k],)
 
-
             inputs = ()
             for shape in inputs_shapes_opt:
                 inputs += (
@@ -279,16 +302,31 @@ class TRT_MODEL_CONVERSION_BASE:
             return ()
 
         os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
-        torch.onnx.export(
-            unet,
-            inputs,
-            output_onnx,
-            verbose=False,
-            input_names=input_names,
-            output_names=output_names,
-            opset_version=17,
-            dynamic_axes=dynamic_axes,
-        )
+        # Disable ComfyUI's custom weight casting on all modules before
+        # ONNX export. The cast_bias_weight path uses .view(dtype=...) which
+        # JIT traces as aten::view(Tensor, int) — unsupported by alias analysis.
+        # With weights already loaded in the correct dtype, standard nn.Module
+        # forward methods suffice.
+        _cast_restore = []
+        for m in unet.modules():
+            if hasattr(m, "comfy_cast_weights") and m.comfy_cast_weights:
+                _cast_restore.append(m)
+                m.comfy_cast_weights = False
+        try:
+            torch.onnx.export(
+                unet,
+                inputs,
+                output_onnx,
+                verbose=False,
+                input_names=input_names,
+                output_names=output_names,
+                opset_version=17,
+                dynamic_axes=dynamic_axes,
+                dynamo=False,
+            )
+        finally:
+            for m in _cast_restore:
+                m.comfy_cast_weights = True
 
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
