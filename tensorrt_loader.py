@@ -160,6 +160,7 @@ class TrTUnet(TrTEngine):
         max_batch = dims[2][0]
 
         # Split batch if our batch is bigger than the max batch size the trt engine supports
+        curr_split_batch = 1
         for i in range(max_batch, min_batch - 1, -1):
             if batch_size % i == 0:
                 curr_split_batch = batch_size // i
@@ -404,8 +405,8 @@ class TensorRTRefitLoader:
         if model_type in ("flux_dev", "flux_schnell"):
             weight_dtype = torch.bfloat16
         cpu_weights = {}
-        for k, v in src_sd.items():
-            cpu_weights[k] = v.to(dtype=weight_dtype).cpu().numpy()
+        for k in list(src_sd.keys()):
+            cpu_weights[k] = src_sd.pop(k).to(dtype=weight_dtype).cpu().numpy()
         del src_sd
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()

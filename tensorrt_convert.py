@@ -1,5 +1,6 @@
 import torch
 import os
+import shutil
 import time
 from contextlib import contextmanager
 
@@ -474,7 +475,10 @@ class TRT_MODEL_CONVERSION_BASE:
                 ),
             )
 
-        os.makedirs(os.path.join(self.output_dir, os.path.dirname(filename_prefix)), exist_ok=True)
+        os.makedirs(
+            os.path.join(self.output_dir, os.path.dirname(filename_prefix)),
+            exist_ok=True,
+        )
         serialized_engine = builder.build_serialized_network(network, config)
 
         full_output_folder, filename, counter, subfolder, filename_prefix = (
@@ -488,6 +492,13 @@ class TRT_MODEL_CONVERSION_BASE:
             f.write(serialized_engine)
 
         self._save_timing_cache(config)
+
+        # Clean up temp ONNX directory (includes external data files)
+        onnx_dir = os.path.dirname(output_onnx)
+        try:
+            shutil.rmtree(onnx_dir)
+        except OSError:
+            pass
 
         return ()
 
@@ -996,7 +1007,10 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
                     ),
                 )
 
-            os.makedirs(os.path.join(self.output_dir, os.path.dirname(filename_prefix)), exist_ok=True)
+            os.makedirs(
+                os.path.join(self.output_dir, os.path.dirname(filename_prefix)),
+                exist_ok=True,
+            )
             serialized_engine = builder.build_serialized_network(network, config)
             if serialized_engine is None:
                 raise RuntimeError(f"TensorRT engine build failed for VAE {operation}")
@@ -1013,9 +1027,9 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
 
             self._save_timing_cache(config)
         finally:
-            # Clean up temp ONNX regardless of success/failure
+            # Clean up temp ONNX directory (includes external data files)
             try:
-                os.remove(output_onnx)
+                shutil.rmtree(os.path.dirname(output_onnx))
             except OSError:
                 pass
 
