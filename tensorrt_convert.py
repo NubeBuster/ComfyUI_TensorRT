@@ -228,7 +228,12 @@ class TRT_MODEL_CONVERSION_BASE:
         num_video_frames,
         is_static: bool,
         enable_refit: bool = False,
+        prompt=None,
+        unique_id=None,
     ):
+        filename_prefix = _resolve_filename_prefix(
+            filename_prefix, "unet", prompt, unique_id, input_name="model"
+        )
         output_onnx = os.path.normpath(
             os.path.join(
                 os.path.join(self.temp_dir, "{}".format(time.time())), "model.onnx"
@@ -525,14 +530,14 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                 "model": (
                     "MODEL",
                     {
-                        "tooltip": "UNet model to convert. Connect to a checkpoint loader output."
+                        "tooltip": "UNet/DiT model from a checkpoint loader. LoRA and other patches are baked into the engine."
                     },
                 ),
                 "filename_prefix": (
                     "STRING",
                     {
-                        "default": "tensorrt/ComfyUI_DYN",
-                        "tooltip": "Output filename prefix. Engines are saved to the ComfyUI output directory under this path.",
+                        "default": "DYN_{modelname}",
+                        "tooltip": "Engine filename prefix. {modelname} is replaced with the source model's name (from the connected loader). Engines are saved to output/tensorrt/unet/ by default; include a path separator to override.",
                     },
                 ),
                 "batch_size_min": (
@@ -542,7 +547,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 100,
                         "step": 1,
-                        "tooltip": "Minimum batch size for the optimization profile.",
+                        "tooltip": "Lowest batch size the engine will accept.",
                     },
                 ),
                 "batch_size_opt": (
@@ -552,7 +557,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 100,
                         "step": 1,
-                        "tooltip": "Optimal batch size for the optimization profile.",
+                        "tooltip": "Batch size TRT optimizes kernel selection for. Best performance at this value.",
                     },
                 ),
                 "batch_size_max": (
@@ -562,7 +567,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 100,
                         "step": 1,
-                        "tooltip": "Maximum batch size for the optimization profile.",
+                        "tooltip": "Highest batch size the engine will accept. Wider range = more VRAM.",
                     },
                 ),
                 "height_min": (
@@ -572,7 +577,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
-                        "tooltip": "Minimum height in pixels.",
+                        "tooltip": "Lowest height the engine will accept.",
                     },
                 ),
                 "height_opt": (
@@ -582,7 +587,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
-                        "tooltip": "Optimal height in pixels.",
+                        "tooltip": "Height TRT optimizes kernel selection for. Best performance at this value.",
                     },
                 ),
                 "height_max": (
@@ -592,7 +597,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
-                        "tooltip": "Maximum height in pixels.",
+                        "tooltip": "Highest height the engine will accept. Wider range = more VRAM.",
                     },
                 ),
                 "width_min": (
@@ -602,7 +607,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
-                        "tooltip": "Minimum width in pixels.",
+                        "tooltip": "Lowest width the engine will accept.",
                     },
                 ),
                 "width_opt": (
@@ -612,7 +617,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
-                        "tooltip": "Optimal width in pixels.",
+                        "tooltip": "Width TRT optimizes kernel selection for. Best performance at this value.",
                     },
                 ),
                 "width_max": (
@@ -622,7 +627,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
-                        "tooltip": "Maximum width in pixels.",
+                        "tooltip": "Highest width the engine will accept. Wider range = more VRAM.",
                     },
                 ),
                 "context_min": (
@@ -632,7 +637,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 128,
                         "step": 1,
-                        "tooltip": "Minimum CLIP context multiplier for the optimization profile.",
+                        "tooltip": "Lowest CLIP context multiplier. 1 = standard CLIP, 2 = long CLIP (SDXL).",
                     },
                 ),
                 "context_opt": (
@@ -642,7 +647,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 128,
                         "step": 1,
-                        "tooltip": "Optimal CLIP context multiplier for the optimization profile.",
+                        "tooltip": "CLIP context multiplier TRT optimizes for. 1 = standard, 2 = long CLIP (SDXL).",
                     },
                 ),
                 "context_max": (
@@ -652,7 +657,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 128,
                         "step": 1,
-                        "tooltip": "Maximum CLIP context multiplier for the optimization profile.",
+                        "tooltip": "Highest CLIP context multiplier. 1 = standard, 2 = long CLIP (SDXL).",
                     },
                 ),
                 "num_video_frames": (
@@ -672,6 +677,10 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "tooltip": "Allow weight updates after building (for LoRA swapping). Slightly larger engine file.",
                     },
                 ),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
             },
         }
 
@@ -693,6 +702,8 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         context_max,
         num_video_frames,
         enable_refit,
+        prompt=None,
+        unique_id=None,
     ):
         return super()._convert(
             model,
@@ -712,6 +723,8 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
             num_video_frames,
             is_static=False,
             enable_refit=enable_refit,
+            prompt=prompt,
+            unique_id=unique_id,
         )
 
 
@@ -732,14 +745,14 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                 "model": (
                     "MODEL",
                     {
-                        "tooltip": "UNet model to convert. Connect to a checkpoint loader output."
+                        "tooltip": "UNet/DiT model from a checkpoint loader. LoRA and other patches are baked into the engine."
                     },
                 ),
                 "filename_prefix": (
                     "STRING",
                     {
-                        "default": "tensorrt/ComfyUI_STAT",
-                        "tooltip": "Output filename prefix. Engines are saved to the ComfyUI output directory under this path.",
+                        "default": "STAT_{modelname}",
+                        "tooltip": "Engine filename prefix. {modelname} is replaced with the source model's name (from the connected loader). Engines are saved to output/tensorrt/unet/ by default; include a path separator to override.",
                     },
                 ),
                 "batch_size_opt": (
@@ -779,7 +792,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 128,
                         "step": 1,
-                        "tooltip": "Fixed CLIP context multiplier.",
+                        "tooltip": "Fixed CLIP context multiplier. 1 = standard, 2 = long CLIP (SDXL).",
                     },
                 ),
                 "num_video_frames": (
@@ -800,6 +813,10 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                     },
                 ),
             },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     def convert(
@@ -812,6 +829,8 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         context_opt,
         num_video_frames,
         enable_refit,
+        prompt=None,
+        unique_id=None,
     ):
         return super()._convert(
             model,
@@ -831,6 +850,8 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
             num_video_frames,
             is_static=True,
             enable_refit=enable_refit,
+            prompt=prompt,
+            unique_id=unique_id,
         )
 
 
@@ -1082,7 +1103,7 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                         "min": 64,
                         "max": 4096,
                         "step": 8,
-                        "tooltip": "Minimum height in pixels.",
+                        "tooltip": "Lowest height the engine will accept.",
                     },
                 ),
                 "height_opt": (
@@ -1092,7 +1113,7 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                         "min": 64,
                         "max": 4096,
                         "step": 8,
-                        "tooltip": "Optimal height in pixels.",
+                        "tooltip": "Height TRT optimizes kernel selection for. Best performance at this value.",
                     },
                 ),
                 "height_max": (
@@ -1102,7 +1123,7 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                         "min": 64,
                         "max": 4096,
                         "step": 8,
-                        "tooltip": "Maximum height in pixels.",
+                        "tooltip": "Highest height the engine will accept. Wider range = more VRAM.",
                     },
                 ),
                 "width_min": (
@@ -1112,7 +1133,7 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                         "min": 64,
                         "max": 4096,
                         "step": 8,
-                        "tooltip": "Minimum width in pixels.",
+                        "tooltip": "Lowest width the engine will accept.",
                     },
                 ),
                 "width_opt": (
@@ -1122,7 +1143,7 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                         "min": 64,
                         "max": 4096,
                         "step": 8,
-                        "tooltip": "Optimal width in pixels.",
+                        "tooltip": "Width TRT optimizes kernel selection for. Best performance at this value.",
                     },
                 ),
                 "width_max": (
@@ -1132,7 +1153,7 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                         "min": 64,
                         "max": 4096,
                         "step": 8,
-                        "tooltip": "Maximum width in pixels.",
+                        "tooltip": "Highest width the engine will accept. Wider range = more VRAM.",
                     },
                 ),
             },
