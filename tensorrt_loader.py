@@ -530,7 +530,216 @@ class TensorRTRefitLoader:
         return (patcher,)
 
 
+# --- VAE TRT Loading ---
+
+
+class TrTVae:
+    """TRT engine wrapper for VAE operations, analogous to TrTUnet."""
+
+    def __init__(self, engine_path):
+        self.engine_path = engine_path
+        self.engine = None
+        self.context = None
+
+        # Probe engine for VRAM accounting, then free immediately
+        with open(engine_path, "rb") as f:
+            data = f.read()
+            engine = runtime.deserialize_cuda_engine(data)
+        self.context_memory_size = engine.device_memory_size
+        self.engine_weight_size = len(data)
+        self.total_vram_size = self.engine_weight_size + self.context_memory_size
+        del engine, data
+        comfy.model_management.soft_empty_cache()
+        trt_logger.info(
+            f"TRT VAE probed: {engine_path} "
+            f"(weights: {self.engine_weight_size / (1024 * 1024):.0f} MB, "
+            f"context: {self.context_memory_size / (1024 * 1024):.0f} MB)"
+        )
+
+    def _load(self):
+        """Deserialize engine and create execution context."""
+        if self.engine is not None:
+            return
+        trt_logger.info(f"TRT VAE loading engine: {self.engine_path}")
+        with open(self.engine_path, "rb") as f:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        if self.engine is None:
+            raise RuntimeError(
+                f"Failed to deserialize TensorRT engine: {self.engine_path}\n"
+                "The engine file may be corrupt or built with an incompatible "
+                "TensorRT version. Try rebuilding the engine."
+            )
+        self.context = self.engine.create_execution_context()
+
+    def _unload(self):
+        """Release engine and execution context VRAM."""
+        if self.engine is None:
+            return
+        trt_logger.info("TRT VAE unloading engine")
+        del self.context
+        del self.engine
+        self.context = None
+        self.engine = None
+
+    def __call__(self, input_tensor, output_shape):
+        """Run single input -> single output inference."""
+        self._load()
+        self.context.set_input_shape("input", list(input_tensor.shape))
+
+        out_dtype = trt_datatype_to_torch(self.engine.get_tensor_dtype("output"))
+        out = torch.empty(output_shape, device=input_tensor.device, dtype=out_dtype)
+
+        self.context.set_tensor_address("input", input_tensor.data_ptr())
+        self.context.set_tensor_address("output", out.data_ptr())
+
+        stream = torch.cuda.default_stream(input_tensor.device)
+        self.context.execute_async_v3(stream_handle=stream.cuda_stream)
+        return out
+
+
+class TrtVAE:
+    """ComfyUI VAE-compatible wrapper backed by TensorRT engines.
+
+    Supports AutoencoderKL (SD1.5/SDXL). Outputs from TensorRTVAELoader
+    can be used with any node that accepts VAE (VAEDecode, VAEEncode, etc.).
+    """
+
+    def __init__(self, decode_engine_path, encode_engine_path=None):
+        self.decode_eng = TrTVae(decode_engine_path) if decode_engine_path else None
+        self.encode_eng = TrTVae(encode_engine_path) if encode_engine_path else None
+
+        # Standard ComfyUI VAE interface attributes
+        self.output_channels = 3
+        self.device = torch.device("cuda")
+        self.vae_dtype = torch.float16
+        self.output_device = torch.device("cpu")
+        self.latent_channels = 4
+        self.latent_dim = 2
+        self.downscale_ratio = 8
+        self.upscale_ratio = 8
+        self.working_dtypes = [torch.float16]
+        self.first_stage_model = None
+        self.process_input = lambda x: x * 2.0 - 1.0
+        self.process_output = lambda x: torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+        self.memory_used_encode = lambda shape, dtype: 0
+        self.memory_used_decode = lambda shape, dtype: 0
+
+        # VRAM estimate from engine probes (more accurate than file size)
+        trt_mem = sum(
+            e.total_vram_size for e in [self.decode_eng, self.encode_eng] if e
+        )
+        outer = torch.nn.Module()
+        outer.model_loaded_weight_memory = 0
+        self.patcher = comfy.model_patcher.ModelPatcher(
+            outer,
+            load_device=comfy.model_management.vae_device(),
+            offload_device=comfy.model_management.vae_offload_device(),
+            size=trt_mem,
+        )
+
+        decode_eng = self.decode_eng
+        encode_eng = self.encode_eng
+
+        def _on_load(p, _device_to, _lowvram, _force_patch, _full_load):
+            torch.cuda.empty_cache()
+            if decode_eng:
+                decode_eng._load()
+            if encode_eng:
+                encode_eng._load()
+            p.model.model_loaded_weight_memory = trt_mem
+
+        def _on_detach(p, _unpatch_all):
+            # Keep engines hot — same rationale as TrTUnet
+            pass
+
+        self.patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
+        self.patcher.add_callback(
+            comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach
+        )
+
+        trt_logger.info(
+            f"TRT VAE registered with ComfyUI memory manager "
+            f"({trt_mem / (1024 * 1024):.0f} MB)"
+        )
+
+    def throw_exception_if_invalid(self):
+        pass
+
+    def decode(self, samples_in, **kwargs):
+        if self.decode_eng is None:
+            raise ValueError("No TRT decode engine loaded")
+        B, C, H, W = samples_in.shape
+        comfy.model_management.load_models_gpu([self.patcher])
+
+        scale = self.upscale_ratio
+        inp = samples_in.to(dtype=self.vae_dtype, device=self.device)
+        out = self.decode_eng(inp, (B, self.output_channels, H * scale, W * scale))
+        out = self.process_output(out.float())
+        return out.movedim(1, -1).to(self.output_device)  # BCHW -> BHWC
+
+    def encode(self, pixel_samples, **kwargs):
+        if self.encode_eng is None:
+            raise ValueError("No TRT encode engine loaded")
+        x = pixel_samples.movedim(-1, 1)  # BHWC -> BCHW
+        x = self.process_input(x)
+        B, C, H, W = x.shape
+        comfy.model_management.load_models_gpu([self.patcher])
+
+        scale = self.downscale_ratio
+        inp = x.to(dtype=self.vae_dtype, device=self.device)
+        latent = self.encode_eng(inp, (B, self.latent_channels, H // scale, W // scale))
+        return latent.float().to(self.output_device)
+
+    def decode_tiled(self, *args, **kwargs):
+        raise NotImplementedError("Tiled decoding not supported with TRT engines")
+
+    def encode_tiled(self, *args, **kwargs):
+        raise NotImplementedError("Tiled encoding not supported with TRT engines")
+
+    def vae_encode_crop_pixels(self, pixels):
+        h = (pixels.shape[1] // self.downscale_ratio) * self.downscale_ratio
+        w = (pixels.shape[2] // self.downscale_ratio) * self.downscale_ratio
+        return pixels[:, :h, :w, :]
+
+    def spacial_compression_encode(self):
+        return self.downscale_ratio
+
+    def spacial_compression_decode(self):
+        return self.upscale_ratio
+
+
+class TensorRTVAELoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        engines = folder_paths.get_filename_list("tensorrt")
+        return {
+            "required": {
+                "decode_engine": (engines,),
+                "encode_engine": (["(none)"] + list(engines),),
+            },
+        }
+
+    RETURN_TYPES = ("VAE",)
+    FUNCTION = "load_vae"
+    CATEGORY = "TensorRT"
+
+    def load_vae(self, decode_engine, encode_engine="(none)"):
+        dec_path = folder_paths.get_full_path("tensorrt", decode_engine)
+        if not os.path.isfile(dec_path):
+            raise FileNotFoundError(f"Decode engine not found: {dec_path}")
+
+        enc_path = None
+        if encode_engine and encode_engine != "(none)":
+            enc_path = folder_paths.get_full_path("tensorrt", encode_engine)
+            if not os.path.isfile(enc_path):
+                raise FileNotFoundError(f"Encode engine not found: {enc_path}")
+
+        vae = TrtVAE(dec_path, enc_path)
+        return (vae,)
+
+
 NODE_CLASS_MAPPINGS = {
     "TensorRTLoader": TensorRTLoader,
     "TensorRTRefitLoader": TensorRTRefitLoader,
+    "TensorRTVAELoader": TensorRTVAELoader,
 }

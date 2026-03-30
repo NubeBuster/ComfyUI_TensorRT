@@ -23,14 +23,19 @@ Defers TRT engine deserialization to first use and reports true VRAM cost (weigh
 
 Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap LoRA weights (any combination, any strength) into a pre-built TRT engine in seconds instead of rebuilding from scratch (minutes). See **[REFIT.md](REFIT.md)** for setup steps, usage guide, and FAQ.
 
-### WIP
+### 5. VAE TensorRT
+
+TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL). Three new nodes:
+
+- **Static VAE TRT Conversion** / **Dynamic VAE TRT Conversion** — Build VAE TRT engines from any VAE graph input (checkpoint loader, standalone VAE loader, etc.). One engine per operation (decode/encode). Static or dynamic resolution profiles.
+- **TensorRT VAE Loader** — Load decode + optional encode engines as a standard `VAE` output. Drop-in replacement: works with VAEDecode, VAEEncode, or any node accepting VAE.
 
 ### And then?
 
 #### WIP
 
 - **Better UX Nodes** — The current building and loading is not very user friendly. Wouldn't it be nice to have a loader node with widgets that allow you to define you want the model requested for loading to be built if not present, provided you define the parameters for the build? Wouldn't it be nice if the Refit feature was decorated with the ability to just change the LoRA settings in the external load and have this repo do the dirty work?
-- **VAE TensorRT** — TRT-accelerated SDXL VAE decode. Implemented separately, to be refactored into this repo.
+- ~~**VAE TensorRT** — TRT-accelerated SDXL VAE decode. Implemented separately, to be refactored into this repo.~~
 - **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
 
 #### Shelved
@@ -54,6 +59,11 @@ Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap LoRA wei
 - Stable Video Diffusion-XT 
 - AuraFlow
 - Flux
+
+**VAE acceleration (AutoencoderKL):**
+
+- Stable Diffusion 1.x / 2.x
+- SDXL / SDXL Turbo
 
 ## Requirements
 

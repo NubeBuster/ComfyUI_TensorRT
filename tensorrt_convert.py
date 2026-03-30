@@ -691,7 +691,324 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         )
 
 
+# --- VAE TRT Conversion ---
+
+
+class VAEEncoderWrapper(torch.nn.Module):
+    """Wraps VAE encoder + quant_conv + mean extraction for ONNX export."""
+
+    def __init__(self, encoder, quant_conv):
+        super().__init__()
+        self.encoder = encoder
+        self.quant_conv = quant_conv
+
+    def forward(self, x):
+        z = self.encoder(x)
+        z = self.quant_conv(z)
+        return z.chunk(2, dim=1)[0]
+
+
+class VAEDecoderWrapper(torch.nn.Module):
+    """Wraps VAE post_quant_conv + decoder for ONNX export."""
+
+    def __init__(self, post_quant_conv, decoder):
+        super().__init__()
+        self.post_quant_conv = post_quant_conv
+        self.decoder = decoder
+
+    def forward(self, z):
+        z = self.post_quant_conv(z)
+        return self.decoder(z)
+
+
+class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
+    """Base for VAE TRT conversion. Supports AutoencoderKL (SD1.5/SDXL)."""
+
+    RETURN_TYPES = ()
+    FUNCTION = "convert"
+    OUTPUT_NODE = True
+    CATEGORY = "TensorRT"
+
+    def _convert_vae(
+        self,
+        vae,
+        filename_prefix,
+        operation,
+        height_min,
+        height_opt,
+        height_max,
+        width_min,
+        width_opt,
+        width_max,
+        is_static,
+    ):
+        output_onnx = os.path.normpath(
+            os.path.join(self.temp_dir, "{}".format(time.time()), "vae.onnx")
+        )
+
+        # Load VAE to GPU
+        comfy.model_management.unload_all_models()
+        comfy.model_management.load_models_gpu([vae.patcher], force_full_load=True)
+
+        first_stage = vae.first_stage_model
+        if not hasattr(first_stage, "post_quant_conv"):
+            raise ValueError(
+                "Only AutoencoderKL VAEs are supported (SD1.5/SDXL). "
+                "This VAE is missing post_quant_conv."
+            )
+
+        latent_channels = first_stage.post_quant_conv.weight.shape[1]
+        dtype = (
+            first_stage.post_quant_conv.weight.dtype
+        )  # detect before float32 conversion
+        device = comfy.model_management.get_torch_device()
+        first_stage = first_stage.float().to(device)
+        first_stage.eval()
+
+        if operation == "encode":
+            wrapper = VAEEncoderWrapper(first_stage.encoder, first_stage.quant_conv)
+            wrapper.eval()
+            dummy = torch.randn(1, 3, height_opt, width_opt, device=device)
+            input_names = ["input"]
+            output_names = ["output"]
+            dynamic_axes = {
+                "input": {0: "batch", 2: "height", 3: "width"},
+                "output": {0: "batch", 2: "latent_height", 3: "latent_width"},
+            }
+            shape_min = (1, 3, height_min, width_min)
+            shape_opt = (1, 3, height_opt, width_opt)
+            shape_max = (1, 3, height_max, width_max)
+        else:  # decode
+            wrapper = VAEDecoderWrapper(
+                first_stage.post_quant_conv, first_stage.decoder
+            )
+            wrapper.eval()
+            dummy = torch.randn(
+                1, latent_channels, height_opt // 8, width_opt // 8, device=device
+            )
+            input_names = ["input"]
+            output_names = ["output"]
+            dynamic_axes = {
+                "input": {0: "batch", 2: "latent_height", 3: "latent_width"},
+                "output": {0: "batch", 2: "height", 3: "width"},
+            }
+            shape_min = (1, latent_channels, height_min // 8, width_min // 8)
+            shape_opt = (1, latent_channels, height_opt // 8, width_opt // 8)
+            shape_max = (1, latent_channels, height_max // 8, width_max // 8)
+
+        # Disable comfy_cast_weights for ONNX tracing
+        _cast_restore = []
+        for m in wrapper.modules():
+            if hasattr(m, "comfy_cast_weights") and m.comfy_cast_weights:
+                _cast_restore.append(m)
+                m.comfy_cast_weights = False
+
+        os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
+        try:
+            torch.onnx.export(
+                wrapper,
+                dummy,
+                output_onnx,
+                verbose=False,
+                input_names=input_names,
+                output_names=output_names,
+                opset_version=17,
+                dynamic_axes=dynamic_axes,
+                dynamo=False,
+            )
+        finally:
+            for m in _cast_restore:
+                m.comfy_cast_weights = True
+
+        # Free VRAM for TRT build
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+
+        # TRT build (same pattern as _convert)
+        try:
+            logger = trt.Logger(trt.Logger.INFO)
+            builder = trt.Builder(logger)
+            network = builder.create_network(
+                1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+            )
+            parser = trt.OnnxParser(network, logger)
+            success = parser.parse_from_file(output_onnx)
+            if not success:
+                errors = [parser.get_error(idx) for idx in range(parser.num_errors)]
+                raise RuntimeError(
+                    "Failed to parse VAE ONNX model:\n"
+                    + "\n".join(str(e) for e in errors)
+                )
+
+            config = builder.create_builder_config()
+            profile = builder.create_optimization_profile()
+            self._setup_timing_cache(config)
+            config.progress_monitor = TQDMProgressMonitor()
+
+            profile.set_shape("input", shape_min, shape_opt, shape_max)
+            if dtype == torch.float16:
+                config.set_flag(trt.BuilderFlag.FP16)
+            if dtype == torch.bfloat16:
+                config.set_flag(trt.BuilderFlag.BF16)
+            config.add_optimization_profile(profile)
+
+            if is_static:
+                filename_prefix = "{}_{}_${}".format(
+                    filename_prefix,
+                    operation,
+                    "-".join(("stat", "h", str(height_opt), "w", str(width_opt))),
+                )
+            else:
+                filename_prefix = "{}_{}_${}".format(
+                    filename_prefix,
+                    operation,
+                    "-".join(
+                        (
+                            "dyn",
+                            "h",
+                            str(height_min),
+                            str(height_max),
+                            str(height_opt),
+                            "w",
+                            str(width_min),
+                            str(width_max),
+                            str(width_opt),
+                        )
+                    ),
+                )
+
+            serialized_engine = builder.build_serialized_network(network, config)
+            if serialized_engine is None:
+                raise RuntimeError(f"TensorRT engine build failed for VAE {operation}")
+
+            full_output_folder, filename, counter, subfolder, filename_prefix = (
+                folder_paths.get_save_image_path(filename_prefix, self.output_dir)
+            )
+            output_trt_engine = os.path.join(
+                full_output_folder, f"{filename}_{counter:05}_.engine"
+            )
+
+            with open(output_trt_engine, "wb") as f:
+                f.write(serialized_engine)
+
+            self._save_timing_cache(config)
+        finally:
+            # Clean up temp ONNX regardless of success/failure
+            try:
+                os.remove(output_onnx)
+            except OSError:
+                pass
+
+        return ()
+
+
+class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
+    def __init__(self):
+        super(DYNAMIC_VAE_TRT_CONVERSION, self).__init__()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae": ("VAE",),
+                "operation": (["decode", "encode"],),
+                "filename_prefix": ("STRING", {"default": "tensorrt/ComfyUI_VAE_DYN"}),
+                "height_min": (
+                    "INT",
+                    {"default": 512, "min": 64, "max": 4096, "step": 8},
+                ),
+                "height_opt": (
+                    "INT",
+                    {"default": 1024, "min": 64, "max": 4096, "step": 8},
+                ),
+                "height_max": (
+                    "INT",
+                    {"default": 2048, "min": 64, "max": 4096, "step": 8},
+                ),
+                "width_min": (
+                    "INT",
+                    {"default": 512, "min": 64, "max": 4096, "step": 8},
+                ),
+                "width_opt": (
+                    "INT",
+                    {"default": 1024, "min": 64, "max": 4096, "step": 8},
+                ),
+                "width_max": (
+                    "INT",
+                    {"default": 2048, "min": 64, "max": 4096, "step": 8},
+                ),
+            },
+        }
+
+    def convert(
+        self,
+        vae,
+        operation,
+        filename_prefix,
+        height_min,
+        height_opt,
+        height_max,
+        width_min,
+        width_opt,
+        width_max,
+    ):
+        return self._convert_vae(
+            vae,
+            filename_prefix,
+            operation,
+            height_min,
+            height_opt,
+            height_max,
+            width_min,
+            width_opt,
+            width_max,
+            is_static=False,
+        )
+
+
+class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
+    def __init__(self):
+        super(STATIC_VAE_TRT_CONVERSION, self).__init__()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae": ("VAE",),
+                "operation": (["decode", "encode"],),
+                "filename_prefix": (
+                    "STRING",
+                    {"default": "tensorrt/ComfyUI_VAE_STAT"},
+                ),
+                "height_opt": (
+                    "INT",
+                    {"default": 1024, "min": 64, "max": 4096, "step": 8},
+                ),
+                "width_opt": (
+                    "INT",
+                    {"default": 1024, "min": 64, "max": 4096, "step": 8},
+                ),
+            },
+        }
+
+    def convert(self, vae, operation, filename_prefix, height_opt, width_opt):
+        return self._convert_vae(
+            vae,
+            filename_prefix,
+            operation,
+            height_opt,
+            height_opt,
+            height_opt,
+            width_opt,
+            width_opt,
+            width_opt,
+            is_static=True,
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "DYNAMIC_TRT_MODEL_CONVERSION": DYNAMIC_TRT_MODEL_CONVERSION,
     "STATIC_TRT_MODEL_CONVERSION": STATIC_TRT_MODEL_CONVERSION,
+    "DYNAMIC_VAE_TRT_CONVERSION": DYNAMIC_VAE_TRT_CONVERSION,
+    "STATIC_VAE_TRT_CONVERSION": STATIC_VAE_TRT_CONVERSION,
 }
