@@ -1,8 +1,9 @@
 import torch
 import os
 import time
-import comfy.model_management
+from contextlib import contextmanager
 
+import comfy.model_management
 import tensorrt as trt
 import folder_paths
 from tqdm import tqdm
@@ -54,7 +55,7 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
             }
         except KeyboardInterrupt:
             # The phase_start callback cannot directly cancel the build, so request the cancellation from within step_complete.
-            _step_result = False
+            self._step_result = False
 
     def phase_finish(self, phase_name):
         try:
@@ -80,7 +81,7 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
                 del self._active_phases[phase_name]
             pass
         except KeyboardInterrupt:
-            _step_result = False
+            self._step_result = False
 
     def step_complete(self, phase_name, step):
         try:
@@ -94,10 +95,81 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
             return False
 
 
+# Known loader class_type -> input key that holds the model filename
+_LOADER_MODEL_KEYS = {
+    "CheckpointLoaderSimple": "ckpt_name",
+    "CheckpointLoader": "ckpt_name",
+    "unCLIPCheckpointLoader": "ckpt_name",
+    "VAELoader": "vae_name",
+}
+
+
+def _derive_model_name(prompt, unique_id, input_name="vae"):
+    """Trace an input back through the workflow graph to find the source model name."""
+    if not prompt or unique_id is None:
+        return None
+    try:
+        node_data = prompt.get(str(unique_id), {})
+        source_input = node_data.get("inputs", {}).get(input_name)
+        if not isinstance(source_input, list) or len(source_input) < 1:
+            return None
+        source_id = str(source_input[0])
+        source_node = prompt.get(source_id, {})
+        class_type = source_node.get("class_type", "")
+        model_key = _LOADER_MODEL_KEYS.get(class_type)
+        if not model_key:
+            return None
+        model_path = source_node.get("inputs", {}).get(model_key, "")
+        if not model_path:
+            return None
+        name = os.path.splitext(os.path.basename(model_path))[0]
+        name = name.replace("/", "_").replace("\\", "_").strip("_")
+        return name if name else None
+    except Exception:
+        return None
+
+
+def _resolve_filename_prefix(
+    prefix, model_type_subdir, prompt=None, unique_id=None, input_name="vae"
+):
+    """Resolve {modelname} placeholder and auto-prepend tensorrt subdir.
+
+    If the prefix contains no path separator, engines are saved to
+    output/tensorrt/<model_type_subdir>/ automatically.
+    """
+    if "{modelname}" in prefix:
+        modelname = _derive_model_name(prompt, unique_id, input_name) or "model"
+        prefix = prefix.replace("{modelname}", modelname)
+    if "/" not in prefix and "\\" not in prefix:
+        prefix = f"tensorrt/{model_type_subdir}/{prefix}"
+    return prefix
+
+
+@contextmanager
+def _disable_comfy_cast(module):
+    """Temporarily disable comfy_cast_weights on all submodules for ONNX export.
+
+    ComfyUI's cast_bias_weight uses .view(dtype=...) which traces as
+    aten::view(Tensor, int) — unsupported by ONNX alias analysis.
+    """
+    restore = []
+    for m in module.modules():
+        if hasattr(m, "comfy_cast_weights") and m.comfy_cast_weights:
+            restore.append(m)
+            m.comfy_cast_weights = False
+    try:
+        yield
+    finally:
+        for m in restore:
+            m.comfy_cast_weights = True
+
+
 class TRT_MODEL_CONVERSION_BASE:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
         self.temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.temp_dir, exist_ok=True)
         self.timing_cache_path = os.path.normpath(
             os.path.join(
                 os.path.join(
@@ -303,17 +375,7 @@ class TRT_MODEL_CONVERSION_BASE:
             return ()
 
         os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
-        # Disable ComfyUI's custom weight casting on all modules before
-        # ONNX export. The cast_bias_weight path uses .view(dtype=...) which
-        # JIT traces as aten::view(Tensor, int) — unsupported by alias analysis.
-        # With weights already loaded in the correct dtype, standard nn.Module
-        # forward methods suffice.
-        _cast_restore = []
-        for m in unet.modules():
-            if hasattr(m, "comfy_cast_weights") and m.comfy_cast_weights:
-                _cast_restore.append(m)
-                m.comfy_cast_weights = False
-        try:
+        with _disable_comfy_cast(unet):
             torch.onnx.export(
                 unet,
                 inputs,
@@ -325,9 +387,6 @@ class TRT_MODEL_CONVERSION_BASE:
                 dynamic_axes=dynamic_axes,
                 dynamo=False,
             )
-        finally:
-            for m in _cast_restore:
-                m.comfy_cast_weights = True
 
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
@@ -375,9 +434,11 @@ class TRT_MODEL_CONVERSION_BASE:
 
         config.add_optimization_profile(profile)
 
+        refit_tag = "_refit" if enable_refit else ""
         if is_static:
-            filename_prefix = "{}_${}".format(
+            filename_prefix = "{}{}_${}".format(
                 filename_prefix,
+                refit_tag,
                 "-".join(
                     (
                         "stat",
@@ -391,8 +452,9 @@ class TRT_MODEL_CONVERSION_BASE:
                 ),
             )
         else:
-            filename_prefix = "{}_${}".format(
+            filename_prefix = "{}{}_${}".format(
                 filename_prefix,
+                refit_tag,
                 "-".join(
                     (
                         "dyn",
@@ -412,6 +474,7 @@ class TRT_MODEL_CONVERSION_BASE:
                 ),
             )
 
+        os.makedirs(os.path.join(self.output_dir, os.path.dirname(filename_prefix)), exist_ok=True)
         serialized_engine = builder.build_serialized_network(network, config)
 
         full_output_folder, filename, counter, subfolder, filename_prefix = (
@@ -430,6 +493,14 @@ class TRT_MODEL_CONVERSION_BASE:
 
 
 class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
+    DESCRIPTION = (
+        "Build a TensorRT UNet engine with dynamic batch/resolution/context ranges.\n\n"
+        "The engine accepts any dimensions between min and max. TRT optimizes "
+        "specifically for the opt (optimal) values — best performance occurs "
+        "at opt, with gradual degradation toward the extremes.\n\n"
+        "Dynamic engines use more VRAM than static; the wider the range, the more VRAM consumed."
+    )
+
     def __init__(self):
         super(DYNAMIC_TRT_MODEL_CONVERSION, self).__init__()
 
@@ -437,8 +508,19 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("MODEL",),
-                "filename_prefix": ("STRING", {"default": "tensorrt/ComfyUI_DYN"}),
+                "model": (
+                    "MODEL",
+                    {
+                        "tooltip": "UNet model to convert. Connect to a checkpoint loader output."
+                    },
+                ),
+                "filename_prefix": (
+                    "STRING",
+                    {
+                        "default": "tensorrt/ComfyUI_DYN",
+                        "tooltip": "Output filename prefix. Engines are saved to the ComfyUI output directory under this path.",
+                    },
+                ),
                 "batch_size_min": (
                     "INT",
                     {
@@ -446,6 +528,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 100,
                         "step": 1,
+                        "tooltip": "Minimum batch size for the optimization profile.",
                     },
                 ),
                 "batch_size_opt": (
@@ -455,6 +538,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 100,
                         "step": 1,
+                        "tooltip": "Optimal batch size for the optimization profile.",
                     },
                 ),
                 "batch_size_max": (
@@ -464,6 +548,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 100,
                         "step": 1,
+                        "tooltip": "Maximum batch size for the optimization profile.",
                     },
                 ),
                 "height_min": (
@@ -473,6 +558,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
+                        "tooltip": "Minimum height in pixels.",
                     },
                 ),
                 "height_opt": (
@@ -482,6 +568,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
+                        "tooltip": "Optimal height in pixels.",
                     },
                 ),
                 "height_max": (
@@ -491,6 +578,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
+                        "tooltip": "Maximum height in pixels.",
                     },
                 ),
                 "width_min": (
@@ -500,6 +588,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
+                        "tooltip": "Minimum width in pixels.",
                     },
                 ),
                 "width_opt": (
@@ -509,6 +598,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
+                        "tooltip": "Optimal width in pixels.",
                     },
                 ),
                 "width_max": (
@@ -518,6 +608,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
+                        "tooltip": "Maximum width in pixels.",
                     },
                 ),
                 "context_min": (
@@ -527,6 +618,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 128,
                         "step": 1,
+                        "tooltip": "Minimum CLIP context multiplier for the optimization profile.",
                     },
                 ),
                 "context_opt": (
@@ -536,6 +628,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 128,
                         "step": 1,
+                        "tooltip": "Optimal CLIP context multiplier for the optimization profile.",
                     },
                 ),
                 "context_max": (
@@ -545,6 +638,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 128,
                         "step": 1,
+                        "tooltip": "Maximum CLIP context multiplier for the optimization profile.",
                     },
                 ),
                 "num_video_frames": (
@@ -554,9 +648,16 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 0,
                         "max": 1000,
                         "step": 1,
+                        "tooltip": "Number of video frames (for SVD models). Set to 14 for SVD, 0 for image models.",
                     },
                 ),
-                "enable_refit": ("BOOLEAN", {"default": False}),
+                "enable_refit": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Allow weight updates after building (for LoRA swapping). Slightly larger engine file.",
+                    },
+                ),
             },
         }
 
@@ -601,6 +702,12 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
 
 
 class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
+    DESCRIPTION = (
+        "Build a TensorRT UNet engine for fixed dimensions.\n\n"
+        "Best performance — TRT fully optimizes for the exact batch size, "
+        "resolution, and context length. Only accepts inputs at these values."
+    )
+
     def __init__(self):
         super(STATIC_TRT_MODEL_CONVERSION, self).__init__()
 
@@ -608,8 +715,19 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("MODEL",),
-                "filename_prefix": ("STRING", {"default": "tensorrt/ComfyUI_STAT"}),
+                "model": (
+                    "MODEL",
+                    {
+                        "tooltip": "UNet model to convert. Connect to a checkpoint loader output."
+                    },
+                ),
+                "filename_prefix": (
+                    "STRING",
+                    {
+                        "default": "tensorrt/ComfyUI_STAT",
+                        "tooltip": "Output filename prefix. Engines are saved to the ComfyUI output directory under this path.",
+                    },
+                ),
                 "batch_size_opt": (
                     "INT",
                     {
@@ -617,6 +735,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 100,
                         "step": 1,
+                        "tooltip": "Fixed batch size for the engine.",
                     },
                 ),
                 "height_opt": (
@@ -626,6 +745,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
+                        "tooltip": "Fixed height in pixels.",
                     },
                 ),
                 "width_opt": (
@@ -635,6 +755,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 256,
                         "max": 4096,
                         "step": 16,
+                        "tooltip": "Fixed width in pixels.",
                     },
                 ),
                 "context_opt": (
@@ -644,6 +765,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 1,
                         "max": 128,
                         "step": 1,
+                        "tooltip": "Fixed CLIP context multiplier.",
                     },
                 ),
                 "num_video_frames": (
@@ -653,9 +775,16 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "min": 0,
                         "max": 1000,
                         "step": 1,
+                        "tooltip": "Number of video frames (for SVD models). Set to 14 for SVD, 0 for image models.",
                     },
                 ),
-                "enable_refit": ("BOOLEAN", {"default": False}),
+                "enable_refit": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Allow weight updates after building (for LoRA swapping). Slightly larger engine file.",
+                    },
+                ),
             },
         }
 
@@ -796,15 +925,8 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
             shape_opt = (1, latent_channels, height_opt // 8, width_opt // 8)
             shape_max = (1, latent_channels, height_max // 8, width_max // 8)
 
-        # Disable comfy_cast_weights for ONNX tracing
-        _cast_restore = []
-        for m in wrapper.modules():
-            if hasattr(m, "comfy_cast_weights") and m.comfy_cast_weights:
-                _cast_restore.append(m)
-                m.comfy_cast_weights = False
-
         os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
-        try:
+        with _disable_comfy_cast(wrapper):
             torch.onnx.export(
                 wrapper,
                 dummy,
@@ -816,9 +938,6 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
                 dynamic_axes=dynamic_axes,
                 dynamo=False,
             )
-        finally:
-            for m in _cast_restore:
-                m.comfy_cast_weights = True
 
         # Free VRAM for TRT build
         comfy.model_management.unload_all_models()
@@ -877,6 +996,7 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
                     ),
                 )
 
+            os.makedirs(os.path.join(self.output_dir, os.path.dirname(filename_prefix)), exist_ok=True)
             serialized_engine = builder.build_serialized_network(network, config)
             if serialized_engine is None:
                 raise RuntimeError(f"TensorRT engine build failed for VAE {operation}")
@@ -903,6 +1023,15 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
 
 
 class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
+    DESCRIPTION = (
+        "Build TensorRT VAE engines with a dynamic resolution range.\n\n"
+        "The engine accepts any resolution between min and max. TRT optimizes "
+        "specifically for the opt (optimal) dimensions — best performance occurs "
+        "at opt, with gradual degradation toward the extremes.\n\n"
+        "Dynamic engines use more VRAM than static; the wider the range, the more VRAM consumed.\n\n"
+        "Supports AutoencoderKL (SD 1.x / 2.x / SDXL)."
+    )
+
     def __init__(self):
         super(DYNAMIC_VAE_TRT_CONVERSION, self).__init__()
 
@@ -910,33 +1039,89 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
     def INPUT_TYPES(s):
         return {
             "required": {
-                "vae": ("VAE",),
-                "operation": (["decode + encode", "decode", "encode"],),
-                "filename_prefix": ("STRING", {"default": "tensorrt/ComfyUI_VAE_DYN"}),
+                "vae": (
+                    "VAE",
+                    {
+                        "tooltip": "VAE model from a checkpoint loader or standalone VAE loader."
+                    },
+                ),
+                "operation": (
+                    ["decode + encode", "decode", "encode"],
+                    {
+                        "tooltip": "Which engines to build. 'decode + encode' builds both in one run."
+                    },
+                ),
+                "filename_prefix": (
+                    "STRING",
+                    {
+                        "default": "VAE_DYN_{modelname}",
+                        "tooltip": "Engine filename prefix. {modelname} is replaced with the source model's name (from the connected loader). Engines are saved to output/tensorrt/vae/ by default; include a path separator to override.",
+                    },
+                ),
                 "height_min": (
                     "INT",
-                    {"default": 512, "min": 64, "max": 4096, "step": 8},
+                    {
+                        "default": 512,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 8,
+                        "tooltip": "Minimum height in pixels.",
+                    },
                 ),
                 "height_opt": (
                     "INT",
-                    {"default": 1024, "min": 64, "max": 4096, "step": 8},
+                    {
+                        "default": 1024,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 8,
+                        "tooltip": "Optimal height in pixels.",
+                    },
                 ),
                 "height_max": (
                     "INT",
-                    {"default": 2048, "min": 64, "max": 4096, "step": 8},
+                    {
+                        "default": 2048,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 8,
+                        "tooltip": "Maximum height in pixels.",
+                    },
                 ),
                 "width_min": (
                     "INT",
-                    {"default": 512, "min": 64, "max": 4096, "step": 8},
+                    {
+                        "default": 512,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 8,
+                        "tooltip": "Minimum width in pixels.",
+                    },
                 ),
                 "width_opt": (
                     "INT",
-                    {"default": 1024, "min": 64, "max": 4096, "step": 8},
+                    {
+                        "default": 1024,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 8,
+                        "tooltip": "Optimal width in pixels.",
+                    },
                 ),
                 "width_max": (
                     "INT",
-                    {"default": 2048, "min": 64, "max": 4096, "step": 8},
+                    {
+                        "default": 2048,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 8,
+                        "tooltip": "Maximum width in pixels.",
+                    },
                 ),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
             },
         }
 
@@ -951,7 +1136,12 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         width_min,
         width_opt,
         width_max,
+        prompt=None,
+        unique_id=None,
     ):
+        filename_prefix = _resolve_filename_prefix(
+            filename_prefix, "vae", prompt, unique_id
+        )
         ops = ["decode", "encode"] if operation == "decode + encode" else [operation]
         for op in ops:
             self._convert_vae(
@@ -970,6 +1160,13 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
 
 
 class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
+    DESCRIPTION = (
+        "Build TensorRT VAE engines for a single fixed resolution.\n\n"
+        "Best performance — TRT fully optimizes for the exact dimensions. "
+        "Only accepts inputs at this resolution.\n\n"
+        "Supports AutoencoderKL (SD 1.x / 2.x / SDXL)."
+    )
+
     def __init__(self):
         super(STATIC_VAE_TRT_CONVERSION, self).__init__()
 
@@ -977,24 +1174,65 @@ class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
     def INPUT_TYPES(s):
         return {
             "required": {
-                "vae": ("VAE",),
-                "operation": (["decode + encode", "decode", "encode"],),
+                "vae": (
+                    "VAE",
+                    {
+                        "tooltip": "VAE model from a checkpoint loader or standalone VAE loader."
+                    },
+                ),
+                "operation": (
+                    ["decode + encode", "decode", "encode"],
+                    {
+                        "tooltip": "Which engines to build. 'decode + encode' builds both in one run."
+                    },
+                ),
                 "filename_prefix": (
                     "STRING",
-                    {"default": "tensorrt/ComfyUI_VAE_STAT"},
+                    {
+                        "default": "VAE_STAT_{modelname}",
+                        "tooltip": "Engine filename prefix. {modelname} is replaced with the source model's name (from the connected loader). Engines are saved to output/tensorrt/vae/ by default; include a path separator to override.",
+                    },
                 ),
                 "height_opt": (
                     "INT",
-                    {"default": 1024, "min": 64, "max": 4096, "step": 8},
+                    {
+                        "default": 1024,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 8,
+                        "tooltip": "Fixed height in pixels.",
+                    },
                 ),
                 "width_opt": (
                     "INT",
-                    {"default": 1024, "min": 64, "max": 4096, "step": 8},
+                    {
+                        "default": 1024,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 8,
+                        "tooltip": "Fixed width in pixels.",
+                    },
                 ),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
             },
         }
 
-    def convert(self, vae, operation, filename_prefix, height_opt, width_opt):
+    def convert(
+        self,
+        vae,
+        operation,
+        filename_prefix,
+        height_opt,
+        width_opt,
+        prompt=None,
+        unique_id=None,
+    ):
+        filename_prefix = _resolve_filename_prefix(
+            filename_prefix, "vae", prompt, unique_id
+        )
         ops = ["decode", "encode"] if operation == "decode + encode" else [operation]
         for op in ops:
             self._convert_vae(

@@ -27,19 +27,32 @@ Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap LoRA wei
 
 TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL). Three new nodes:
 
-- **Static VAE TRT Conversion** / **Dynamic VAE TRT Conversion** — Build VAE TRT engines from any VAE graph input (checkpoint loader, standalone VAE loader, etc.). One engine per operation (decode/encode). Static or dynamic resolution profiles.
+- **Static VAE TRT Conversion** / **Dynamic VAE TRT Conversion** — Build VAE TRT engines from any VAE graph input (checkpoint loader, standalone VAE loader, etc.). One engine per operation (decode/encode). Static or dynamic resolution profiles. Supports `{modelname}` placeholder in filename prefix, auto-derived from the connected loader.
 - **TensorRT VAE Loader** — Load decode + optional encode engines as a standard `VAE` output. Drop-in replacement: works with VAEDecode, VAEEncode, or any node accepting VAE.
+
+### 6. Smart Engine Organization
+
+- **Auto-pathing** — VAE engines default to `output/tensorrt/vae/` without requiring a path in the filename prefix.
+- **`{modelname}` placeholder** — Filename prefix supports `{modelname}` which resolves to the source model's name (from the connected checkpoint/VAE loader).
+- **Filtered dropdowns** — UNet loaders only show UNet engines, VAE loader only shows VAE engine pairs, Refit loader only shows refit-enabled engines.
+- **Node descriptions & tooltips** — All nodes have DESCRIPTION attributes and widget tooltips explaining their purpose and options.
+
+### 7. Internal Refactors
+
+- Extracted `TrTEngine` base class from `TrTUnet`/`TrTVae` (shared probe/load/unload lifecycle).
+- `TensorRTLoader.load_unet` deduplicated via shared `_create_model_for_type` and `_wrap_trt_patcher` helpers.
 
 ### And then?
 
 #### WIP
 
 - [x] ~~**VAE TensorRT** — TRT-accelerated SDXL VAE decode. Implemented separately, to be refactored into this repo.~~
-- [ ] **Better UX Nodes** — Streamlined building and loading experience.
+- [x] ~~**Better UX Nodes** — Streamlined building and loading experience.~~
   - [x] ~~VAE builder builds decode + encode in one run (default)~~
   - [x] ~~VAE loader auto-discovers paired decode/encode engines (single dropdown)~~
-  - [x] ~~UNet/VAE engine dropdowns filtered — UNet loaders exclude VAE engines and vice versa~~
-  - [ ] Add DESCRIPTION docstrings and widget tooltips to all nodes
+  - [x] ~~UNet/VAE/Refit engine dropdowns filtered~~
+  - [x] ~~DESCRIPTION docstrings and widget tooltips on all nodes~~
+  - [x] ~~`{modelname}` placeholder and auto-pathing for VAE builders~~
   - [ ] Merged builder + loader for UNet — auto-build engine if not present, with build parameters on the loader node. Maybe split off predetermined build approval or rejection config to a TensorRT Build Config node?
 - [ ] **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
 

@@ -33,7 +33,6 @@ logger = trt.Logger(trt.Logger.INFO)
 runtime = trt.Runtime(logger)
 
 
-# Is there a function that already exists for this?
 def trt_datatype_to_torch(datatype):
     if datatype == trt.float16:
         return torch.float16
@@ -43,14 +42,17 @@ def trt_datatype_to_torch(datatype):
         return torch.int32
     elif datatype == trt.bfloat16:
         return torch.bfloat16
+    else:
+        raise ValueError(f"Unsupported TRT dtype: {datatype}")
 
 
-class TrTUnet:
-    def __init__(self, engine_path):
+class TrTEngine:
+    """Base TRT engine wrapper with probe/load/unload lifecycle."""
+
+    def __init__(self, engine_path, label="TRT"):
         self.engine_path = engine_path
         self.engine = None
         self.context = None
-        self.dtype = torch.float16
 
         # Probe engine to get memory sizes, then free it immediately.
         # device_memory_size = execution context scratch memory (small)
@@ -65,24 +67,23 @@ class TrTUnet:
         del engine, data
         comfy.model_management.soft_empty_cache()
         trt_logger.info(
-            f"TRT UNet probed: {engine_path} "
+            f"{label} probed: {engine_path} "
             f"(weights: {self.engine_weight_size / (1024 * 1024):.0f} MB, "
-            f"context: {self.context_memory_size / (1024 * 1024):.0f} MB, "
-            f"total: {self.total_vram_size / (1024 * 1024):.0f} MB)"
+            f"context: {self.context_memory_size / (1024 * 1024):.0f} MB)"
         )
 
     def _load(self):
         """Deserialize engine and create execution context."""
         if self.engine is not None:
             return
-        trt_logger.info(f"TRT UNet loading engine: {self.engine_path}")
+        trt_logger.info(f"TRT loading engine: {self.engine_path}")
         with open(self.engine_path, "rb") as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         if self.engine is None:
             raise RuntimeError(
                 f"Failed to deserialize TensorRT engine: {self.engine_path}\n"
-                "The engine file may be corrupt or built with an incompatible TensorRT version. "
-                "Try rebuilding the engine."
+                "The engine file may be corrupt or built with an incompatible "
+                "TensorRT version. Try rebuilding the engine."
             )
         self.context = self.engine.create_execution_context()
 
@@ -90,7 +91,7 @@ class TrTUnet:
         """Release engine and execution context VRAM."""
         if self.engine is None:
             return
-        trt_logger.info("TRT UNet unloading engine")
+        trt_logger.info("TRT unloading engine")
         del self.context
         del self.engine
         self.context = None
@@ -98,18 +99,30 @@ class TrTUnet:
 
     @classmethod
     def from_engine(cls, engine):
-        """Create TrTUnet from an already-deserialized (e.g. refitted) engine."""
+        """Create from an already-deserialized engine (e.g. after refit)."""
         obj = cls.__new__(cls)
         obj.engine_path = None
         obj.engine = engine
         obj.context = engine.create_execution_context()
-        obj.dtype = torch.float16
         obj.context_memory_size = engine.device_memory_size
         # Weight memory is already allocated in the engine; use
         # device_memory_size as a conservative total estimate since
         # we can't easily measure serialized size of an in-memory engine.
         obj.engine_weight_size = 0
         obj.total_vram_size = obj.context_memory_size
+        return obj
+
+
+class TrTUnet(TrTEngine):
+    def __init__(self, engine_path):
+        super().__init__(engine_path, label="TRT UNet")
+        self.dtype = torch.float16
+
+    @classmethod
+    def from_engine(cls, engine):
+        """Create TrTUnet from an already-deserialized (e.g. refitted) engine."""
+        obj = super().from_engine(engine)
+        obj.dtype = torch.float16
         return obj
 
     def set_bindings_shape(self, inputs, split_batch):
@@ -144,7 +157,6 @@ class TrTUnet:
         batch_size = x.shape[0]
         dims = self.engine.get_tensor_profile_shape(self.engine.get_tensor_name(0), 0)
         min_batch = dims[0][0]
-        opt_batch = dims[1][0]
         max_batch = dims[2][0]
 
         # Split batch if our batch is bigger than the max batch size the trt engine supports
@@ -183,7 +195,7 @@ class TrTUnet:
         )
         model_inputs_converted[output_binding_name] = out
 
-        stream = torch.cuda.default_stream(x.device)
+        stream = torch.cuda.current_stream(x.device)
         for i in range(curr_split_batch):
             for k in model_inputs_converted:
                 x = model_inputs_converted[k]
@@ -201,122 +213,6 @@ class TrTUnet:
         return {}
 
 
-class TensorRTLoader:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "unet_name": (_list_unet_engines(),),
-                "model_type": (
-                    [
-                        "sdxl_base",
-                        "sdxl_inpaint",
-                        "sdxl_refiner",
-                        "sd1.x",
-                        "sd2.x-768v",
-                        "svd",
-                        "sd3",
-                        "auraflow",
-                        "flux_dev",
-                        "flux_schnell",
-                    ],
-                ),
-            }
-        }
-
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "load_unet"
-    CATEGORY = "TensorRT"
-
-    def load_unet(self, unet_name, model_type):
-        unet_path = folder_paths.get_full_path("tensorrt", unet_name)
-        if not os.path.isfile(unet_path):
-            raise FileNotFoundError(f"File {unet_path} does not exist")
-        unet = TrTUnet(unet_path)
-        if model_type in ("sdxl_base", "sdxl_inpaint"):
-            conf = comfy.supported_models.SDXL({"adm_in_channels": 2816})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = comfy.model_base.SDXL(conf)
-            if model_type == "sdxl_inpaint":
-                model.set_inpaint()
-        elif model_type == "sdxl_refiner":
-            conf = comfy.supported_models.SDXLRefiner({"adm_in_channels": 2560})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = comfy.model_base.SDXLRefiner(conf)
-        elif model_type == "sd1.x":
-            conf = comfy.supported_models.SD15({})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = comfy.model_base.BaseModel(conf)
-        elif model_type == "sd2.x-768v":
-            conf = comfy.supported_models.SD20({})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = comfy.model_base.BaseModel(
-                conf, model_type=comfy.model_base.ModelType.V_PREDICTION
-            )
-        elif model_type == "svd":
-            conf = comfy.supported_models.SVD_img2vid({})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = conf.get_model({})
-        elif model_type == "sd3":
-            conf = comfy.supported_models.SD3({})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = conf.get_model({})
-        elif model_type == "auraflow":
-            conf = comfy.supported_models.AuraFlow({})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = conf.get_model({})
-        elif model_type == "flux_dev":
-            conf = comfy.supported_models.Flux({})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = conf.get_model({})
-            unet.dtype = torch.bfloat16  # TODO: autodetect
-        elif model_type == "flux_schnell":
-            conf = comfy.supported_models.FluxSchnell({})
-            conf.unet_config["disable_unet_model_creation"] = True
-            model = conf.get_model({})
-            unet.dtype = torch.bfloat16  # TODO: autodetect
-        model.diffusion_model = unet
-        model.memory_required = (
-            lambda *args, **kwargs: 0
-        )  # always pass inputs batched up as much as possible, our TRT code will handle batch splitting
-
-        # Report the true VRAM cost (weights + context) so ComfyUI makes
-        # informed eviction decisions. Previously we only reported context
-        # memory (~50 MB), causing ComfyUI to think it could freely evict
-        # and reload the 5 GB engine between XY plot iterations.
-        trt_memory = unet.total_vram_size
-        patcher = comfy.model_patcher.ModelPatcher(
-            model,
-            load_device=comfy.model_management.get_torch_device(),
-            offload_device=comfy.model_management.unet_offload_device(),
-            size=trt_memory,
-        )
-
-        def _on_load(p, _device_to, _lowvram, _force_patch, _full_load):
-            torch.cuda.empty_cache()  # release PyTorch reserved blocks for TRT
-            p.model.diffusion_model._load()
-            p.model.model_loaded_weight_memory = trt_memory
-
-        def _on_detach(p, _unpatch_all):
-            # Don't unload the engine on detach — keep it hot in VRAM.
-            # TRT engine deserialization is very slow (~8s for a 5 GiB engine),
-            # and ComfyUI detaches/reattaches the same model between XY plot
-            # iterations (for VAE decode). Keeping the engine loaded makes
-            # reattach instant. The engine VRAM is freed when the patcher is
-            # garbage collected (i.e. when a different model is loaded).
-            pass
-
-        patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
-        patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach)
-
-        trt_logger.info(
-            f"TRT UNet registered with ComfyUI memory manager "
-            f"({trt_memory / (1024 * 1024):.0f} MB)"
-        )
-
-        return (patcher,)
-
-
 MODEL_TYPE_LIST = [
     "sdxl_base",
     "sdxl_inpaint",
@@ -329,6 +225,41 @@ MODEL_TYPE_LIST = [
     "flux_dev",
     "flux_schnell",
 ]
+
+
+class TensorRTLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "unet_name": (
+                    _list_unet_engines(),
+                    {
+                        "tooltip": "TensorRT engine file to load. Only UNet engines are shown (VAE engines are filtered out)."
+                    },
+                ),
+                "model_type": (
+                    MODEL_TYPE_LIST,
+                    {
+                        "tooltip": "Architecture of the model the engine was built from. Must match exactly."
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load_unet"
+    CATEGORY = "TensorRT"
+    DESCRIPTION = "Load a pre-built TensorRT engine as a UNet model. Select the model architecture to match the engine."
+
+    def load_unet(self, unet_name, model_type):
+        unet_path = folder_paths.get_full_path("tensorrt", unet_name)
+        if not os.path.isfile(unet_path):
+            raise FileNotFoundError(f"File {unet_path} does not exist")
+        unet = TrTUnet(unet_path)
+        model = _create_model_for_type(model_type, unet)
+        patcher = _wrap_trt_patcher(model, unet)
+        return (patcher,)
 
 
 def _create_model_for_type(model_type, unet):
@@ -421,9 +352,24 @@ class TensorRTRefitLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (_list_unet_engines(),),
-                "model_type": (MODEL_TYPE_LIST,),
-                "source_model": ("MODEL",),
+                "unet_name": (
+                    _list_refit_engines(),
+                    {
+                        "tooltip": "Refit-enabled TensorRT engine file. Must have been built with enable_refit=True."
+                    },
+                ),
+                "model_type": (
+                    MODEL_TYPE_LIST,
+                    {
+                        "tooltip": "Architecture of the model the engine was built from. Must match exactly."
+                    },
+                ),
+                "source_model": (
+                    "MODEL",
+                    {
+                        "tooltip": "Source model with LoRA/weights applied. Its weights will be written into the TRT engine."
+                    },
+                ),
             },
         }
 
@@ -437,6 +383,11 @@ class TensorRTRefitLoader:
     )
 
     def load_and_refit(self, unet_name, model_type, source_model):
+        if unet_name == _NO_REFIT_ENGINES:
+            raise ValueError(
+                "No refit-enabled TRT engines found. Build an engine with "
+                "enable_refit=True first."
+            )
         unet_path = folder_paths.get_full_path("tensorrt", unet_name)
         if not os.path.isfile(unet_path):
             raise FileNotFoundError(f"File {unet_path} does not exist")
@@ -537,30 +488,49 @@ class TensorRTRefitLoader:
 # e.g. "ComfyUI_VAE_STAT_decode_$stat-h-1024-w-1024_00001_.engine"
 #   -> base key "ComfyUI_VAE_STAT_$stat-h-1024-w-1024_00001_"
 _ENGINE_OP_RE = re.compile(r"_(decode|encode)_")
+_REFIT_RE = re.compile(r"_refit_")
+_NO_REFIT_ENGINES = "(no refit engines found)"
+_NO_VAE_ENGINES = "(no VAE engines found)"
 _vae_engine_set_map = {}
 
 
 def _list_unet_engines():
-    """List TRT engine files, excluding VAE engines (decode/encode)."""
+    """List TRT engine files, excluding VAE and refit engines."""
     return [
         f
         for f in folder_paths.get_filename_list("tensorrt")
-        if not _ENGINE_OP_RE.search(f)
+        if not _ENGINE_OP_RE.search(f) and not _REFIT_RE.search(f)
     ]
+
+
+def _list_refit_engines():
+    """List refit-enabled TRT engine files (excluding VAE engines)."""
+    engines = [
+        f
+        for f in folder_paths.get_filename_list("tensorrt")
+        if _REFIT_RE.search(f) and not _ENGINE_OP_RE.search(f)
+    ]
+    return engines if engines else [_NO_REFIT_ENGINES]
+
+
+_VAE_ENGINE_DIR = os.path.join(folder_paths.models_dir, "tensorrt", "vae")
 
 
 def _list_vae_engine_sets():
     """Discover VAE engine sets by grouping decode/encode pairs by base key.
 
+    Lists the vae/ subdirectory directly (bare filenames, no path prefix).
     Returns a list of display keys for the dropdown. Each key maps to
     a pair of engine filenames (decode + optional encode).
     """
     global _vae_engine_set_map
     _vae_engine_set_map = {}
 
-    engines = folder_paths.get_filename_list("tensorrt")
+    if not os.path.exists(_VAE_ENGINE_DIR):
+        return [_NO_VAE_ENGINES]
+
     groups = {}  # base_key -> {"decode": filename, "encode": filename}
-    for f in sorted(engines):
+    for f in sorted(os.listdir(_VAE_ENGINE_DIR)):
         if not f.endswith(".engine"):
             continue
         stem = f[: -len(".engine")]
@@ -575,7 +545,7 @@ def _list_vae_engine_sets():
         groups[base_key][operation] = f
 
     if not groups:
-        return ["(no VAE engines found)"]
+        return [_NO_VAE_ENGINES]
 
     keys = []
     for base_key in sorted(groups):
@@ -585,71 +555,44 @@ def _list_vae_engine_sets():
         _vae_engine_set_map[base_key] = group
         keys.append(base_key)
 
-    return keys if keys else ["(no VAE engines found)"]
+    return keys if keys else [_NO_VAE_ENGINES]
 
 
-class TrTVae:
-    """TRT engine wrapper for VAE operations, analogous to TrTUnet."""
+class TrTVae(TrTEngine):
+    """TRT engine wrapper for VAE operations."""
 
     def __init__(self, engine_path):
-        self.engine_path = engine_path
-        self.engine = None
-        self.context = None
-
-        # Probe engine for VRAM accounting, then free immediately
-        with open(engine_path, "rb") as f:
-            data = f.read()
-            engine = runtime.deserialize_cuda_engine(data)
-        self.context_memory_size = engine.device_memory_size
-        self.engine_weight_size = len(data)
-        self.total_vram_size = self.engine_weight_size + self.context_memory_size
-        del engine, data
-        comfy.model_management.soft_empty_cache()
-        trt_logger.info(
-            f"TRT VAE probed: {engine_path} "
-            f"(weights: {self.engine_weight_size / (1024 * 1024):.0f} MB, "
-            f"context: {self.context_memory_size / (1024 * 1024):.0f} MB)"
-        )
-
-    def _load(self):
-        """Deserialize engine and create execution context."""
-        if self.engine is not None:
-            return
-        trt_logger.info(f"TRT VAE loading engine: {self.engine_path}")
-        with open(self.engine_path, "rb") as f:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        if self.engine is None:
-            raise RuntimeError(
-                f"Failed to deserialize TensorRT engine: {self.engine_path}\n"
-                "The engine file may be corrupt or built with an incompatible "
-                "TensorRT version. Try rebuilding the engine."
-            )
-        self.context = self.engine.create_execution_context()
-
-    def _unload(self):
-        """Release engine and execution context VRAM."""
-        if self.engine is None:
-            return
-        trt_logger.info("TRT VAE unloading engine")
-        del self.context
-        del self.engine
-        self.context = None
-        self.engine = None
+        super().__init__(engine_path, label="TRT VAE")
 
     def __call__(self, input_tensor, output_shape):
-        """Run single input -> single output inference."""
+        """Run single input -> single output inference.
+
+        Mirrors the allocate_buffers + infer pattern from Engine (trt_engine.py):
+        pre-allocate contiguous I/O buffers, copy input, execute, return output.
+        """
         self._load()
+
+        # Allocate contiguous I/O buffers (same pattern as Engine.allocate_buffers)
+        in_dtype = trt_datatype_to_torch(self.engine.get_tensor_dtype("input"))
+        in_buf = torch.empty(
+            list(input_tensor.shape), dtype=in_dtype, device=input_tensor.device
+        )
         self.context.set_input_shape("input", list(input_tensor.shape))
 
         out_dtype = trt_datatype_to_torch(self.engine.get_tensor_dtype("output"))
-        out = torch.empty(output_shape, device=input_tensor.device, dtype=out_dtype)
+        out_buf = torch.empty(output_shape, dtype=out_dtype, device=input_tensor.device)
 
-        self.context.set_tensor_address("input", input_tensor.data_ptr())
-        self.context.set_tensor_address("output", out.data_ptr())
+        # Copy input into contiguous buffer, set addresses, execute
+        in_buf.copy_(input_tensor)
+        self.context.set_tensor_address("input", in_buf.data_ptr())
+        self.context.set_tensor_address("output", out_buf.data_ptr())
 
-        stream = torch.cuda.default_stream(input_tensor.device)
-        self.context.execute_async_v3(stream_handle=stream.cuda_stream)
-        return out
+        stream = torch.cuda.current_stream(input_tensor.device)
+        ok = self.context.execute_async_v3(stream_handle=stream.cuda_stream)
+        if not ok:
+            raise RuntimeError("TensorRT VAE inference failed")
+        torch.cuda.synchronize()
+        return out_buf
 
 
 class TrtVAE:
@@ -768,16 +711,22 @@ class TensorRTVAELoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "engine": (_list_vae_engine_sets(),),
+                "engine": (
+                    _list_vae_engine_sets(),
+                    {
+                        "tooltip": "VAE engine set to load. Shows matched decode+encode pairs discovered from the engine directory."
+                    },
+                ),
             },
         }
 
     RETURN_TYPES = ("VAE",)
     FUNCTION = "load_vae"
     CATEGORY = "TensorRT"
+    DESCRIPTION = "Load pre-built VAE TensorRT engines (decode + optional encode). Engines are auto-discovered as matched pairs from the engine directory."
 
     def load_vae(self, engine):
-        if engine == "(no VAE engines found)":
+        if engine == _NO_VAE_ENGINES:
             raise ValueError(
                 "No VAE TRT engines found. Build them first with a "
                 "VAE TRT Conversion node."
@@ -790,13 +739,13 @@ class TensorRTVAELoader:
         dec_file = engine_set["decode"]
         enc_file = engine_set.get("encode")
 
-        dec_path = folder_paths.get_full_path("tensorrt", dec_file)
+        dec_path = os.path.join(_VAE_ENGINE_DIR, dec_file)
         if not os.path.isfile(dec_path):
             raise FileNotFoundError(f"Decode engine not found: {dec_path}")
 
         enc_path = None
         if enc_file:
-            enc_path = folder_paths.get_full_path("tensorrt", enc_file)
+            enc_path = os.path.join(_VAE_ENGINE_DIR, enc_file)
             if not os.path.isfile(enc_path):
                 raise FileNotFoundError(f"Encode engine not found: {enc_path}")
 
