@@ -469,7 +469,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "default": 512,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 16,
                     },
                 ),
                 "height_opt": (
@@ -478,7 +478,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "default": 512,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 16,
                     },
                 ),
                 "height_max": (
@@ -487,7 +487,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "default": 512,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 16,
                     },
                 ),
                 "width_min": (
@@ -496,7 +496,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "default": 512,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 16,
                     },
                 ),
                 "width_opt": (
@@ -505,7 +505,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "default": 512,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 16,
                     },
                 ),
                 "width_max": (
@@ -514,7 +514,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "default": 512,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 16,
                     },
                 ),
                 "context_min": (
@@ -619,7 +619,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "default": 512,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 16,
                     },
                 ),
                 "width_opt": (
@@ -628,7 +628,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "default": 512,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 16,
                     },
                 ),
                 "context_opt": (
