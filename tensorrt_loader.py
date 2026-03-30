@@ -95,6 +95,22 @@ class TrTUnet:
         self.context = None
         self.engine = None
 
+    @classmethod
+    def from_engine(cls, engine):
+        """Create TrTUnet from an already-deserialized (e.g. refitted) engine."""
+        obj = cls.__new__(cls)
+        obj.engine_path = None
+        obj.engine = engine
+        obj.context = engine.create_execution_context()
+        obj.dtype = torch.float16
+        obj.context_memory_size = engine.device_memory_size
+        # Weight memory is already allocated in the engine; use
+        # device_memory_size as a conservative total estimate since
+        # we can't easily measure serialized size of an in-memory engine.
+        obj.engine_weight_size = 0
+        obj.total_vram_size = obj.context_memory_size
+        return obj
+
     def set_bindings_shape(self, inputs, split_batch):
         for k in inputs:
             shape = inputs[k].shape
@@ -300,6 +316,221 @@ class TensorRTLoader:
         return (patcher,)
 
 
+MODEL_TYPE_LIST = [
+    "sdxl_base",
+    "sdxl_inpaint",
+    "sdxl_refiner",
+    "sd1.x",
+    "sd2.x-768v",
+    "svd",
+    "sd3",
+    "auraflow",
+    "flux_dev",
+    "flux_schnell",
+]
+
+
+def _create_model_for_type(model_type, unet):
+    """Create a ComfyUI model shell for the given model_type and attach unet."""
+    if model_type in ("sdxl_base", "sdxl_inpaint"):
+        conf = comfy.supported_models.SDXL({"adm_in_channels": 2816})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = comfy.model_base.SDXL(conf)
+        if model_type == "sdxl_inpaint":
+            model.set_inpaint()
+    elif model_type == "sdxl_refiner":
+        conf = comfy.supported_models.SDXLRefiner({"adm_in_channels": 2560})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = comfy.model_base.SDXLRefiner(conf)
+    elif model_type == "sd1.x":
+        conf = comfy.supported_models.SD15({})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = comfy.model_base.BaseModel(conf)
+    elif model_type == "sd2.x-768v":
+        conf = comfy.supported_models.SD20({})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = comfy.model_base.BaseModel(
+            conf, model_type=comfy.model_base.ModelType.V_PREDICTION
+        )
+    elif model_type == "svd":
+        conf = comfy.supported_models.SVD_img2vid({})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = conf.get_model({})
+    elif model_type == "sd3":
+        conf = comfy.supported_models.SD3({})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = conf.get_model({})
+    elif model_type == "auraflow":
+        conf = comfy.supported_models.AuraFlow({})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = conf.get_model({})
+    elif model_type == "flux_dev":
+        conf = comfy.supported_models.Flux({})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = conf.get_model({})
+        unet.dtype = torch.bfloat16
+    elif model_type == "flux_schnell":
+        conf = comfy.supported_models.FluxSchnell({})
+        conf.unet_config["disable_unet_model_creation"] = True
+        model = conf.get_model({})
+        unet.dtype = torch.bfloat16
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+    model.diffusion_model = unet
+    model.memory_required = lambda *args, **kwargs: 0
+    return model
+
+
+def _wrap_trt_patcher(model, unet):
+    """Wrap a TRT model in a ModelPatcher with load/unload callbacks."""
+    trt_memory = unet.total_vram_size
+    patcher = comfy.model_patcher.ModelPatcher(
+        model,
+        load_device=comfy.model_management.get_torch_device(),
+        offload_device=comfy.model_management.unet_offload_device(),
+        size=trt_memory,
+    )
+
+    def _on_load(p, _device_to, _lowvram, _force_patch, _full_load):
+        torch.cuda.empty_cache()
+        p.model.diffusion_model._load()
+        p.model.model_loaded_weight_memory = trt_memory
+
+    def _on_detach(p, _unpatch_all):
+        pass
+
+    patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
+    patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach)
+
+    trt_logger.info(
+        f"TRT UNet registered with ComfyUI memory manager "
+        f"({trt_memory / (1024 * 1024):.0f} MB)"
+    )
+    return patcher
+
+
+class TensorRTRefitLoader:
+    """Load a refit-enabled TRT engine and update its weights from a source model.
+
+    This allows swapping LoRA weights into a pre-built TRT engine in seconds
+    instead of rebuilding the engine from scratch (minutes).
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "unet_name": (folder_paths.get_filename_list("tensorrt"),),
+                "model_type": (MODEL_TYPE_LIST,),
+                "source_model": ("MODEL",),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load_and_refit"
+    CATEGORY = "TensorRT"
+    DESCRIPTION = (
+        "Load a refit-enabled TRT engine and update its weights from a source "
+        "model (e.g. checkpoint + LoRA). The engine must have been built with "
+        "enable_refit=True. This is much faster than rebuilding the engine."
+    )
+
+    def load_and_refit(self, unet_name, model_type, source_model):
+        unet_path = folder_paths.get_full_path("tensorrt", unet_name)
+        if not os.path.isfile(unet_path):
+            raise FileNotFoundError(f"File {unet_path} does not exist")
+
+        # --- Step 1: Extract LoRA-patched weights from source model ---
+        trt_logger.info("Refit: loading source model to extract weights...")
+        comfy.model_management.load_models_gpu(
+            [source_model], force_patch_weights=True, force_full_load=True
+        )
+        src_sd = source_model.model.diffusion_model.state_dict()
+        # Copy to CPU numpy immediately so we can free GPU for the TRT engine.
+        # Use float16 to match the ONNX export precision.
+        weight_dtype = torch.float16
+        if model_type in ("flux_dev", "flux_schnell"):
+            weight_dtype = torch.bfloat16
+        cpu_weights = {}
+        for k, v in src_sd.items():
+            cpu_weights[k] = v.to(dtype=weight_dtype).cpu().numpy()
+        del src_sd
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+
+        # --- Step 2: Deserialize the TRT engine ---
+        trt_logger.info(f"Refit: deserializing engine: {unet_path}")
+        torch.cuda.empty_cache()
+        with open(unet_path, "rb") as f:
+            engine = runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            raise RuntimeError(
+                f"Failed to deserialize TensorRT engine: {unet_path}\n"
+                "The engine file may be corrupt or built with an incompatible "
+                "TensorRT version."
+            )
+
+        # --- Step 3: Refit weights ---
+        trt_logger.info("Refit: applying weights to engine...")
+        refitter = trt.Refitter(engine, logger)
+
+        trt_weight_names = set(refitter.get_all_weights())
+        if not trt_weight_names:
+            del refitter, engine
+            raise RuntimeError(
+                "Engine has no refittable weights. Was it built with enable_refit=True?"
+            )
+
+        matched = 0
+        missing_in_trt = 0
+        for trt_name in trt_weight_names:
+            # TRT weight names have "unet." prefix from the ONNX export wrapper
+            if trt_name.startswith("unet."):
+                pytorch_key = trt_name[len("unet.") :]
+            else:
+                pytorch_key = trt_name
+
+            if pytorch_key not in cpu_weights:
+                trt_logger.debug(
+                    f"Refit: TRT weight '{trt_name}' has no match in source "
+                    f"model (may be fused/optimized) — skipping"
+                )
+                missing_in_trt += 1
+                continue
+
+            refitter.set_named_weights(trt_name, trt.Weights(cpu_weights[pytorch_key]))
+            matched += 1
+
+        missing = refitter.get_missing_weights()
+        if missing:
+            trt_logger.warning(
+                f"Refit: {len(missing)} weights still missing after mapping: "
+                f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
+            )
+
+        trt_logger.info(
+            f"Refit: {matched} weights mapped, "
+            f"{missing_in_trt} TRT weights without source match, "
+            f"{len(missing)} still missing"
+        )
+
+        success = refitter.refit_cuda_engine()
+        del refitter, cpu_weights
+        if not success:
+            del engine
+            raise RuntimeError(
+                "TensorRT engine refit failed. Check the log for details."
+            )
+        trt_logger.info("Refit: engine weights updated successfully")
+
+        # --- Step 4: Create model patcher ---
+        unet = TrTUnet.from_engine(engine)
+        model = _create_model_for_type(model_type, unet)
+        patcher = _wrap_trt_patcher(model, unet)
+        return (patcher,)
+
+
 NODE_CLASS_MAPPINGS = {
     "TensorRTLoader": TensorRTLoader,
+    "TensorRTRefitLoader": TensorRTRefitLoader,
 }

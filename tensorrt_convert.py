@@ -151,6 +151,7 @@ class TRT_MODEL_CONVERSION_BASE:
         context_max,
         num_video_frames,
         is_static: bool,
+        enable_refit: bool = False,
     ):
         output_onnx = os.path.normpath(
             os.path.join(
@@ -369,6 +370,8 @@ class TRT_MODEL_CONVERSION_BASE:
             config.set_flag(trt.BuilderFlag.FP16)
         if dtype == torch.bfloat16:
             config.set_flag(trt.BuilderFlag.BF16)
+        if enable_refit:
+            config.set_flag(trt.BuilderFlag.REFIT)
 
         config.add_optimization_profile(profile)
 
@@ -553,6 +556,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "step": 1,
                     },
                 ),
+                "enable_refit": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -573,6 +577,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         context_opt,
         context_max,
         num_video_frames,
+        enable_refit,
     ):
         return super()._convert(
             model,
@@ -591,6 +596,7 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
             context_max,
             num_video_frames,
             is_static=False,
+            enable_refit=enable_refit,
         )
 
 
@@ -649,6 +655,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                         "step": 1,
                     },
                 ),
+                "enable_refit": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -661,6 +668,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
         width_opt,
         context_opt,
         num_video_frames,
+        enable_refit,
     ):
         return super()._convert(
             model,
@@ -679,6 +687,7 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
             context_opt,
             num_video_frames,
             is_static=True,
+            enable_refit=enable_refit,
         )
 
 
