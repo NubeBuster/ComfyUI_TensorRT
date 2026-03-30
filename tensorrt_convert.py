@@ -1,3 +1,4 @@
+import logging
 import torch
 import os
 import shutil
@@ -8,6 +9,8 @@ import comfy.model_management
 import tensorrt as trt
 import folder_paths
 from tqdm import tqdm
+
+log = logging.getLogger(__name__)
 
 # TODO:
 # Make it more generic: less model specific code
@@ -194,9 +197,9 @@ class TRT_MODEL_CONVERSION_BASE:
         if os.path.exists(self.timing_cache_path):
             with open(self.timing_cache_path, mode="rb") as timing_cache_file:
                 buffer = timing_cache_file.read()
-            print("Read {} bytes from timing cache.".format(len(buffer)))
+            log.info("Read %d bytes from timing cache.", len(buffer))
         else:
-            print("No timing cache found; Initializing a new one.")
+            log.info("No timing cache found; Initializing a new one.")
         timing_cache: trt.ITimingCache = config.create_timing_cache(buffer)
         config.set_timing_cache(timing_cache, ignore_mismatch=True)
 
@@ -372,7 +375,7 @@ class TRT_MODEL_CONVERSION_BASE:
                 )
 
         else:
-            print("ERROR: model not supported.")
+            log.error("Model not supported.")
             return ()
 
         os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
@@ -402,10 +405,10 @@ class TRT_MODEL_CONVERSION_BASE:
         parser = trt.OnnxParser(network, logger)
         success = parser.parse_from_file(output_onnx)
         for idx in range(parser.num_errors):
-            print(parser.get_error(idx))
+            log.error("ONNX parse error: %s", parser.get_error(idx))
 
         if not success:
-            print("ONNX load ERROR")
+            log.error("ONNX load failed")
             return ()
 
         config = builder.create_builder_config()

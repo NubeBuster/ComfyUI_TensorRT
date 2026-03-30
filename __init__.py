@@ -5,7 +5,6 @@ from .tensorrt_convert import STATIC_VAE_TRT_CONVERSION
 from .tensorrt_loader import TensorRTLoader
 from .tensorrt_loader import TensorRTRefitLoader
 from .tensorrt_loader import TensorRTVAELoader
-from .tensorrt_loader import TrTUnet
 
 NODE_CLASS_MAPPINGS = {
     "DYNAMIC_TRT_MODEL_CONVERSION": DYNAMIC_TRT_MODEL_CONVERSION,
