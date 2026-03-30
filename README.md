@@ -34,19 +34,19 @@ TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL)
 
 #### WIP
 
-- **Better UX Nodes** — The current building and loading is not very user friendly. Wouldn't it be nice to have a loader node with widgets that allow you to define you want the model requested for loading to be built if not present, provided you define the parameters for the build? Wouldn't it be nice if the Refit feature was decorated with the ability to just change the LoRA settings in the external load and have this repo do the dirty work?
-- ~~**VAE TensorRT** — TRT-accelerated SDXL VAE decode. Implemented separately, to be refactored into this repo.~~
-- **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
+- [ ] **Better UX Nodes** — The current building and loading is not very user friendly. Wouldn't it be nice to have a loader node with widgets that allow you to define you want the model requested for loading to be built if not present, provided you define the parameters for the build? Wouldn't it be nice if the Refit feature was decorated with the ability to just change the LoRA settings in the external load and have this repo do the dirty work?
+- [x] ~~**VAE TensorRT** — TRT-accelerated SDXL VAE decode. Implemented separately, to be refactored into this repo.~~
+- [ ] **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
+
+#### TODO
+
+- [ ] **Refit persistence** — serialize refitted engine to RAM or disk, avoiding re-refit after VRAM eviction
 
 #### Shelved
 
 - **WAN 2.2 VAE** — VAE is not viable for TRT (temporal caching is inherently sequential).
 
   <small>The developing LLM agent, Opus 4.5, managed to implement a working VAE decode for WAN. VAE encode is allegedly entirely incompatible with TRT. Only after attempting the implementation of both did I manage to inform the agent they had a gap in their reasoning. We implemented VAE decode, but it's inherently only possible to implement TRT for it that is less efficient than default. `"Way she goes." Or something like that.`</small>
-
-#### TODO
-
-- **Refit persistence** — serialize refitted engine to RAM or disk, avoiding re-refit after VRAM eviction
 
 ## Supports
 
