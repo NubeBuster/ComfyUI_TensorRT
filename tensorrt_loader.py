@@ -337,15 +337,8 @@ def _wrap_trt_patcher(model, unet):
     def _on_detach(p, _unpatch_all):
         pass
 
-    def _on_cleanup(p):
-        eng = p.model.diffusion_model
-        if eng.engine_path is not None:
-            eng._unload()
-            p.model.model_loaded_weight_memory = 0
-
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach)
-    patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_CLEANUP, _on_cleanup)
 
     trt_logger.info(
         f"TRT UNet registered with ComfyUI memory manager "
@@ -755,19 +748,9 @@ class TrtVAE:
             # Keep engines hot — avoid reload thrash during XY plots
             pass
 
-        def _on_cleanup(p):
-            if decode_eng:
-                decode_eng._unload()
-            if encode_eng:
-                encode_eng._unload()
-            p.model.model_loaded_weight_memory = 0
-
         self.patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
         self.patcher.add_callback(
             comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach
-        )
-        self.patcher.add_callback(
-            comfy.patcher_extension.CallbacksMP.ON_CLEANUP, _on_cleanup
         )
 
         trt_logger.info(

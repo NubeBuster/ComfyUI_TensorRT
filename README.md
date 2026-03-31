@@ -19,11 +19,11 @@ Reduces height/width input step from 64 to 16 for finer-grained resolution contr
 
 Defers TRT engine deserialization to first use and reports true VRAM cost (weights + context scratch) to ComfyUI's memory manager. Previously only context memory (~50 MB) was reported, causing ComfyUI to freely evict and reload multi-GB engines between XY plot iterations.
 
-### 4. LoRA Refit
+### 4. LoRA Refit (not working — TRT 10.4 limitation)
 
-Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap LoRA weights into a pre-built TRT engine in seconds instead of rebuilding from scratch (minutes). See **[REFIT.md](REFIT.md)** for setup steps, usage guide, and FAQ.
+Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. The infrastructure is in place to swap LoRA weights into a pre-built TRT engine in seconds instead of rebuilding. See **[REFIT.md](REFIT.md)** for details.
 
-**Known limitation (TRT 10.4):** TRT fuses attention layers (QKV projections, linear projections) during engine build. Only ~66/788 LoRA-targeted weights map to individually refittable TRT weights — the rest are in fused layers with internal names. `REFIT_INDIVIDUAL` (which should prevent fusion) is defined in TRT 10.4 but broken (produces engines with 0 refittable weights). Full LoRA refit coverage requires a future TRT release that fixes this flag.
+**Status:** Not usable in practice. TRT 10.4 fuses attention layers (QKV projections, linear projections) during engine build, so only ~66/788 LoRA-targeted weights map to refittable TRT weights — the impactful ones (attention weight matrices) are all in fused layers. The `REFIT_INDIVIDUAL` builder flag exists in TRT 10.4 and should prevent this fusion, but it's broken (produces engines with 0 refittable weights). The code is ready — waiting on a TRT release that fixes `REFIT_INDIVIDUAL`.
 
 ### 5. VAE TensorRT
 
@@ -58,9 +58,10 @@ TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL)
   - [ ] Merged builder + loader for UNet — auto-build engine if not present, with build parameters on the loader node. Maybe split off predetermined build approval or rejection config to a TensorRT Build Config node?
 - [ ] **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
 
-#### TODO
+#### Blocked
 
-- [ ] **Refit persistence** — serialize refitted engine to RAM or disk, avoiding re-refit after VRAM eviction
+- [ ] **LoRA Refit** — infrastructure complete, blocked on TRT `REFIT_INDIVIDUAL` bug (see §4)
+- [ ] **Refit persistence** — serialize refitted engine to RAM or disk (moot until refit works)
 
 #### Shelved
 
