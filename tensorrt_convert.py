@@ -440,9 +440,6 @@ class TRT_MODEL_CONVERSION_BASE:
             config.set_flag(trt.BuilderFlag.BF16)
         if enable_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
-            # NOTE: REFIT_INDIVIDUAL (TRT 10.4) should preserve individual
-            # weight names for full LoRA coverage, but it's broken in 10.4 —
-            # produces engines with 0 refittable weights. Revisit on TRT 10.5+.
 
         config.add_optimization_profile(profile)
 

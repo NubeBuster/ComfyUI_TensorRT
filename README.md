@@ -19,11 +19,11 @@ Reduces height/width input step from 64 to 16 for finer-grained resolution contr
 
 Defers TRT engine deserialization to first use and reports true VRAM cost (weights + context scratch) to ComfyUI's memory manager. Previously only context memory (~50 MB) was reported, causing ComfyUI to freely evict and reload multi-GB engines between XY plot iterations.
 
-### 4. LoRA Refit (not working — TRT 10.4 limitation)
+### 4. LoRA Refit (not working)
 
 Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. The infrastructure is in place to swap LoRA weights into a pre-built TRT engine in seconds instead of rebuilding. See **[REFIT.md](REFIT.md)** for details.
 
-**Status:** Not usable in practice. TRT 10.4 fuses attention layers (QKV projections, linear projections) during engine build, so only ~66/788 LoRA-targeted weights map to refittable TRT weights — the impactful ones (attention weight matrices) are all in fused layers. The `REFIT_INDIVIDUAL` builder flag exists in TRT 10.4 and should prevent this fusion, but it's broken (produces engines with 0 refittable weights). The code is ready — waiting on a TRT release that fixes `REFIT_INDIVIDUAL`.
+**Status:** Not usable in practice. TRT fuses attention layers into optimized MHA kernels during engine build, absorbing the weight matrices entirely. The ~722 LoRA-targeted attention weights become non-refittable. See [NubeBuster/ComfyUI_TensorRT#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1) for current progress.
 
 ### 5. VAE TensorRT
 
@@ -60,7 +60,7 @@ TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL)
 
 #### Blocked
 
-- [ ] **LoRA Refit** — infrastructure complete, blocked on TRT `REFIT_INDIVIDUAL` bug (see §4)
+- [ ] **LoRA Refit** — infrastructure complete, blocked on TRT MHA fusion absorbing attention weights ([#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1))
 - [ ] **Refit persistence** — serialize refitted engine to RAM or disk (moot until refit works)
 
 #### Shelved
@@ -196,8 +196,7 @@ TensorRT Engines are loaded using the TensorRT Loader node.
 ## Common Issues/Limitations
 
 ComfyUI TensorRT engines are not yet compatible with ControlNets.
-LoRA support is available via the `TensorRT Refit Loader` node (see
-[Fork Changes](#fork-changes) above).
+LoRA support via the `TensorRT Refit Loader` node is not yet working — see [#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1).
 
 1.  Add a TensorRT Loader node
 2.  Note, if a TensorRT Engine has been created during a ComfyUI
