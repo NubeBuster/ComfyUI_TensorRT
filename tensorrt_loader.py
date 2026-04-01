@@ -374,8 +374,10 @@ def _wrap_trt_patcher(model, unet):
         p.model.model_loaded_weight_memory = trt_memory
 
     def _on_detach(p, _unpatch_all):
-        p.model.diffusion_model._unload()
-        p.model.model_loaded_weight_memory = 0
+        # Keep engine hot — avoid reload thrash during XY plots.
+        # TRT engines can't be partially unloaded like PyTorch models;
+        # unload+reload cycles cost ~4s each for deserialization.
+        pass
 
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach)
