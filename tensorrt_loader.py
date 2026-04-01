@@ -434,7 +434,13 @@ class TensorRTRefitLoader:
                     "Refit: cache hit (patches_uuid unchanged), skipping refit"
                 )
                 return (_refit_loader_cache["patcher"],)
-            trt_logger.info("Refit: cache stale (engine evicted), will reload+refit")
+            # Engine evicted — check persisted refitted engine still exists
+            if cached_unet.engine_path and os.path.isfile(cached_unet.engine_path):
+                trt_logger.info(
+                    "Refit: cache hit (evicted, reloading refitted engine on demand)"
+                )
+                return (_refit_loader_cache["patcher"],)
+            trt_logger.info("Refit: cache invalid (persisted engine missing), will re-refit")
             _refit_loader_cache["patcher"] = None
 
         pbar = comfy.utils.ProgressBar(4)
@@ -632,6 +638,20 @@ class TensorRTRefitLoader:
                 "TensorRT engine refit failed. Check the log for details."
             )
         trt_logger.info("Refit: engine weights updated successfully")
+
+        # Persist refitted engine so ON_LOAD can reload after VRAM eviction
+        try:
+            cache_dir = os.path.join(os.path.dirname(unet_path), ".refit_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            cached_path = os.path.join(cache_dir, os.path.basename(unet_path))
+            data = unet.engine.serialize()
+            with open(cached_path, "wb") as f:
+                f.write(data)
+            del data
+            unet.engine_path = cached_path
+            trt_logger.info("Refit: persisted refitted engine to %s", cached_path)
+        except Exception as e:
+            trt_logger.warning("Refit: failed to persist refitted engine: %s", e)
 
         # --- Step 4: Create model patcher (engine_path preserved for reload) ---
         pbar.update_absolute(3, 4)

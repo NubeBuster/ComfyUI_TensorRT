@@ -45,21 +45,44 @@ def _auto_engine_dir():
     return os.path.join(folder_paths.models_dir, "tensorrt", "auto")
 
 
+def _refit_cache_dir():
+    """Return the hidden refit cache directory path."""
+    d = os.path.join(_auto_engine_dir(), ".refit_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _refit_cache_path(engine_path):
+    """Return the path for a persisted refitted engine."""
+    stem = os.path.basename(engine_path)
+    return os.path.join(_refit_cache_dir(), stem)
+
+
 def _make_engine_filename(prefix, profile_desc):
     """Build the deterministic engine filename (no counter)."""
     return f"{prefix}_refit_${profile_desc}.engine"
 
 
-def _find_by_profile(directory, profile_desc):
-    """Find the newest engine matching a profile desc in a directory."""
+def _find_by_profile(directory, profile_desc, model_name=None):
+    """Find the newest engine matching a profile desc in a directory.
+
+    If model_name is provided, only matches engines whose .meta.json sidecar
+    has a matching model_name. This prevents cross-model collisions when
+    multiple checkpoints share the same resolution/batch/context profile.
+    """
     if not os.path.isdir(directory):
         return None
     pattern = re.compile(re.escape(f"_refit_${profile_desc}"))
     candidates = []
     for f in os.listdir(directory):
-        if f.endswith(".engine") and pattern.search(f):
-            full = os.path.join(directory, f)
-            candidates.append((os.path.getmtime(full), full))
+        if not f.endswith(".engine") or not pattern.search(f):
+            continue
+        full = os.path.join(directory, f)
+        if model_name:
+            meta = _read_meta_sidecar(full)
+            if meta.get("model_name") != model_name:
+                continue
+        candidates.append((os.path.getmtime(full), full))
     if not candidates:
         return None
     candidates.sort(reverse=True)
@@ -155,17 +178,17 @@ def _collect_auto_models_info(auto_dir):
     return models
 
 
-def _find_existing_engine(profile_desc):
-    """Search for a matching engine by profile, checking auto/ first, then output/tensorrt/unet/.
+def _find_existing_engine(profile_desc, model_name=None):
+    """Search for a matching engine by profile + model name (from .meta.json sidecar).
 
-    Detection is profile-based — filename prefix is irrelevant.
+    Checks auto/ first, then output/tensorrt/unet/.
     If found in output dir, symlinks it into auto/. Returns the engine path or None.
     """
     auto_dir = _auto_engine_dir()
     os.makedirs(auto_dir, exist_ok=True)
 
     # Check auto/ dir first
-    found = _find_by_profile(auto_dir, profile_desc)
+    found = _find_by_profile(auto_dir, profile_desc, model_name)
     if found:
         log.info("Auto: found existing engine: %s", found)
         return found
@@ -174,12 +197,12 @@ def _find_existing_engine(profile_desc):
     output_unet_dir = os.path.join(
         folder_paths.get_output_directory(), "tensorrt", "unet"
     )
-    found = _find_by_profile(output_unet_dir, profile_desc)
+    found = _find_by_profile(output_unet_dir, profile_desc, model_name)
     if found:
         log.info("Auto: found matching engine in output dir, symlinking: %s", found)
         return _symlink_into_auto(found, auto_dir)
 
-    log.info("Auto: no existing engine found for profile %s", profile_desc)
+    log.info("Auto: no existing engine found for model=%s profile=%s", model_name, profile_desc)
     return None
 
 
@@ -203,13 +226,17 @@ def _list_real_engines(auto_dir):
 
 
 def _evict_engine(path, size):
-    """Remove an engine file and its sidecars. Returns (filename, size_bytes)."""
+    """Remove an engine file, its sidecars, and refit cache. Returns (filename, size_bytes)."""
     log.info("Auto: FIFO evicting %s (%.1f MB)", path, size / (1024 * 1024))
     os.remove(path)
     for suffix in (".weight_map.json", ".meta.json"):
         sidecar = path.replace(".engine", suffix)
         if os.path.isfile(sidecar) and not os.path.islink(sidecar):
             os.remove(sidecar)
+    # Clean up persisted refit cache
+    cached = _refit_cache_path(path)
+    if os.path.isfile(cached):
+        os.remove(cached)
     return (os.path.basename(path), size)
 
 
@@ -563,6 +590,32 @@ class TensorRTLoaderAuto:
         # Always re-execute — internal caches handle skipping redundant work
         return float("NaN")
 
+    def check_lazy_status(self, model, refit, static_shapes, context_len,
+                          height, width, batch_size,
+                          min_height, opt_height, max_height,
+                          min_width, opt_width, max_width,
+                          min_batch, opt_batch, max_batch, **kwargs):
+        """Skip upstream model evaluation when engine exists and refit is off."""
+        if refit:
+            return ["model"]
+        from .tensorrt_convert import _make_profile_desc
+        if static_shapes == "static":
+            profile_desc = _make_profile_desc(
+                True, batch_size, batch_size, batch_size,
+                height, height, height, width, width, width,
+                context_len=context_len,
+            )
+        else:
+            profile_desc = _make_profile_desc(
+                False, min_batch, opt_batch, max_batch,
+                min_height, opt_height, max_height,
+                min_width, opt_width, max_width,
+                context_len=context_len,
+            )
+        if _find_existing_engine(profile_desc) is not None:
+            return []
+        return ["model"]
+
     RETURN_TYPES = ("MODEL", "STRING")
     RETURN_NAMES = ("model", "info")
     FUNCTION = "execute"
@@ -612,8 +665,9 @@ class TensorRTLoaderAuto:
         pbar = comfy.utils.ProgressBar(4)
 
         # Resolve {modelname} placeholder
+        derived_model_name = _derive_model_name(prompt, unique_id, "model")
         if "{modelname}" in filename_prefix:
-            modelname = _derive_model_name(prompt, unique_id, "model") or "model"
+            modelname = derived_model_name or "model"
             filename_prefix = filename_prefix.replace("{modelname}", modelname)
 
         # Build profile description and expected engine path
@@ -652,7 +706,7 @@ class TensorRTLoaderAuto:
         # Step 1: Find existing engine by profile (prefix-independent)
         pbar.update_absolute(0, 4)
         _send_trt_progress("searching")
-        engine_path = _find_existing_engine(profile_desc)
+        engine_path = _find_existing_engine(profile_desc, derived_model_name)
 
         if engine_path is None:
             if on_missing == "error":
@@ -734,16 +788,20 @@ class TensorRTLoaderAuto:
                 )
 
             _write_meta_sidecar(
-                engine_path, model_type, filename_prefix, profile_desc, refit
+                engine_path, model_type, derived_model_name or filename_prefix,
+                profile_desc, refit,
             )
 
         # Build info JSON
         def _build_info(ep):
+            meta = _read_meta_sidecar(ep)
+            if "model_name" not in meta and derived_model_name:
+                meta["model_name"] = derived_model_name
             info = {
                 "engine_path": ep,
                 "is_symlink": os.path.islink(ep),
                 "engine_size_bytes": os.path.getsize(ep) if os.path.isfile(ep) else 0,
-                **_read_meta_sidecar(ep),
+                **meta,
             }
             if disk_management != "disabled":
                 auto_models = _collect_auto_models_info(auto_dir)
@@ -765,7 +823,6 @@ class TensorRTLoaderAuto:
             and _refit_cache["engine_path"] == engine_path
             and _refit_cache["patcher"] is not None
         ):
-            # Check if engine was evicted from VRAM by model manager
             cached_unet = _refit_cache["patcher"].model.diffusion_model
             if cached_unet.engine is not None:
                 log.info(
@@ -773,9 +830,15 @@ class TensorRTLoaderAuto:
                 )
                 _send_trt_progress("cached")
                 return (_refit_cache["patcher"], _build_info(engine_path))
-            log.info(
-                "Auto: refit cache stale (engine evicted from VRAM), will reload+refit"
-            )
+            # Engine evicted from VRAM but patches unchanged — check that
+            # the persisted refitted engine still exists on disk.
+            if cached_unet.engine_path and os.path.isfile(cached_unet.engine_path):
+                log.info(
+                    "Auto: refit cache hit (evicted, reloading refitted engine on demand)"
+                )
+                _send_trt_progress("cached")
+                return (_refit_cache["patcher"], _build_info(engine_path))
+            log.info("Auto: refit cache invalid (persisted engine missing), will re-refit")
             _refit_cache["patcher"] = None
 
         if (
@@ -814,6 +877,19 @@ class TensorRTLoaderAuto:
             # Refit in-place — preserves engine_path so ON_LOAD can reload from disk
             unet._load()
             _do_refit(unet.engine, engine_path, model, model_type)
+
+            # Persist refitted engine so ON_LOAD can reload it after VRAM eviction
+            # without needing to re-refit (saves ~13s per prompt for SDXL)
+            cached_path = _refit_cache_path(engine_path)
+            try:
+                data = unet.engine.serialize()
+                with open(cached_path, "wb") as f:
+                    f.write(data)
+                del data
+                unet.engine_path = cached_path
+                log.info("Auto: persisted refitted engine to %s", cached_path)
+            except Exception as e:
+                log.warning("Auto: failed to persist refitted engine: %s", e)
 
             _refit_cache["patches_uuid"] = current_uuid
             _refit_cache["engine_path"] = engine_path

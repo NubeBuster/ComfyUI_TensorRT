@@ -502,26 +502,49 @@ _LOADER_MODEL_KEYS = {
 
 
 def _derive_model_name(prompt, unique_id, input_name="vae"):
-    """Trace an input back through the workflow graph to find the source model name."""
+    """Trace an input back through the workflow graph to find the source model name.
+
+    Walks the graph recursively through pass-through nodes (LoRA loaders,
+    model merges, etc.) until a recognized checkpoint/VAE loader is found.
+    """
     if not prompt or unique_id is None:
         return None
     try:
-        node_data = prompt.get(str(unique_id), {})
-        source_input = node_data.get("inputs", {}).get(input_name)
-        if not isinstance(source_input, list) or len(source_input) < 1:
-            return None
-        source_id = str(source_input[0])
-        source_node = prompt.get(source_id, {})
-        class_type = source_node.get("class_type", "")
-        model_key = _LOADER_MODEL_KEYS.get(class_type)
-        if not model_key:
-            return None
-        model_path = source_node.get("inputs", {}).get(model_key, "")
-        if not model_path:
-            return None
-        name = os.path.splitext(os.path.basename(model_path))[0]
-        name = name.replace("/", "_").replace("\\", "_").strip("_")
-        return name if name else None
+        visited = set()
+        current_id = str(unique_id)
+        current_input = input_name
+        log = __import__("logging").getLogger("comfyui_tensorrt")
+        while current_id not in visited:
+            visited.add(current_id)
+            node_data = prompt.get(current_id, {})
+            source_link = node_data.get("inputs", {}).get(current_input)
+            if not isinstance(source_link, list) or len(source_link) < 1:
+                log.info("derive_model_name: no link for input '%s' on node %s (%s)",
+                         current_input, current_id, node_data.get("class_type", "?"))
+                return None
+            source_id = str(source_link[0])
+            source_node = prompt.get(source_id, {})
+            class_type = source_node.get("class_type", "")
+            log.info("derive_model_name: node %s -> %s (%s)", current_id, source_id, class_type)
+            # Check if this is a recognized loader
+            model_key = _LOADER_MODEL_KEYS.get(class_type)
+            if model_key:
+                model_path = source_node.get("inputs", {}).get(model_key, "")
+                if not model_path:
+                    return None
+                name = os.path.splitext(os.path.basename(model_path))[0]
+                name = name.replace("/", "_").replace("\\", "_").strip("_")
+                log.info("derive_model_name: resolved to '%s'", name)
+                return name if name else None
+            # Not a loader — walk through the same-type input (model→model, vae→vae)
+            source_inputs = source_node.get("inputs", {})
+            if current_input in source_inputs:
+                current_id = source_id
+            else:
+                log.info("derive_model_name: node %s (%s) has no '%s' input, keys: %s",
+                         source_id, class_type, current_input, list(source_inputs.keys()))
+                return None
+        return None
     except Exception:
         return None
 
