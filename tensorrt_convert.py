@@ -519,13 +519,22 @@ def _derive_model_name(prompt, unique_id, input_name="vae"):
             node_data = prompt.get(current_id, {})
             source_link = node_data.get("inputs", {}).get(current_input)
             if not isinstance(source_link, list) or len(source_link) < 1:
-                log.info("derive_model_name: no link for input '%s' on node %s (%s)",
-                         current_input, current_id, node_data.get("class_type", "?"))
+                log.info(
+                    "derive_model_name: no link for input '%s' on node %s (%s)",
+                    current_input,
+                    current_id,
+                    node_data.get("class_type", "?"),
+                )
                 return None
             source_id = str(source_link[0])
             source_node = prompt.get(source_id, {})
             class_type = source_node.get("class_type", "")
-            log.info("derive_model_name: node %s -> %s (%s)", current_id, source_id, class_type)
+            log.info(
+                "derive_model_name: node %s -> %s (%s)",
+                current_id,
+                source_id,
+                class_type,
+            )
             # Check if this is a recognized loader
             model_key = _LOADER_MODEL_KEYS.get(class_type)
             if model_key:
@@ -541,8 +550,13 @@ def _derive_model_name(prompt, unique_id, input_name="vae"):
             if current_input in source_inputs:
                 current_id = source_id
             else:
-                log.info("derive_model_name: node %s (%s) has no '%s' input, keys: %s",
-                         source_id, class_type, current_input, list(source_inputs.keys()))
+                log.info(
+                    "derive_model_name: node %s (%s) has no '%s' input, keys: %s",
+                    source_id,
+                    class_type,
+                    current_input,
+                    list(source_inputs.keys()),
+                )
                 return None
         return None
     except Exception:

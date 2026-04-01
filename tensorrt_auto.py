@@ -202,7 +202,11 @@ def _find_existing_engine(profile_desc, model_name=None):
         log.info("Auto: found matching engine in output dir, symlinking: %s", found)
         return _symlink_into_auto(found, auto_dir)
 
-    log.info("Auto: no existing engine found for model=%s profile=%s", model_name, profile_desc)
+    log.info(
+        "Auto: no existing engine found for model=%s profile=%s",
+        model_name,
+        profile_desc,
+    )
     return None
 
 
@@ -240,9 +244,27 @@ def _evict_engine(path, size):
     return (os.path.basename(path), size)
 
 
+def _purge_refit_cache():
+    """Remove all persisted refitted engines. Returns total bytes freed."""
+    cache_dir = _refit_cache_dir()
+    freed = 0
+    for f in os.listdir(cache_dir):
+        if not f.endswith(".engine"):
+            continue
+        path = os.path.join(cache_dir, f)
+        size = os.path.getsize(path)
+        log.info("Auto: purging refit cache %s (%.1f MB)", f, size / (1024 * 1024))
+        os.remove(path)
+        freed += size
+    return freed
+
+
 def _fifo_evict_max_usage(auto_dir, max_bytes, estimated_new_bytes=0):
-    """Evict oldest real engines until auto/ dir is under max_bytes. Returns list of (filename, size_bytes)."""
+    """Evict refit cache first, then oldest base engines until under max_bytes. Returns list of (filename, size_bytes)."""
+    # Refit cache is expendable — purge it first
     entries, total_real = _list_real_engines(auto_dir)
+    if total_real + estimated_new_bytes > max_bytes:
+        _purge_refit_cache()
     evicted = []
     for _mtime, path, size in entries:
         if total_real + estimated_new_bytes <= max_bytes:
@@ -253,7 +275,12 @@ def _fifo_evict_max_usage(auto_dir, max_bytes, estimated_new_bytes=0):
 
 
 def _fifo_evict_min_free(auto_dir, min_free_bytes, estimated_new_bytes=0):
-    """Evict oldest real engines until drive has min_free_bytes free. Returns list of (filename, size_bytes)."""
+    """Evict refit cache first, then oldest base engines until drive has min_free_bytes free. Returns list of (filename, size_bytes)."""
+    # Refit cache is expendable — purge it first
+    stat = os.statvfs(auto_dir)
+    free = stat.f_bavail * stat.f_frsize
+    if free - estimated_new_bytes < min_free_bytes:
+        _purge_refit_cache()
     entries, _ = _list_real_engines(auto_dir)
     evicted = []
     for _mtime, path, size in entries:
@@ -590,26 +617,57 @@ class TensorRTLoaderAuto:
         # Always re-execute — internal caches handle skipping redundant work
         return float("NaN")
 
-    def check_lazy_status(self, model, refit, static_shapes, context_len,
-                          height, width, batch_size,
-                          min_height, opt_height, max_height,
-                          min_width, opt_width, max_width,
-                          min_batch, opt_batch, max_batch, **kwargs):
+    def check_lazy_status(
+        self,
+        model,
+        refit,
+        static_shapes,
+        context_len,
+        height,
+        width,
+        batch_size,
+        min_height,
+        opt_height,
+        max_height,
+        min_width,
+        opt_width,
+        max_width,
+        min_batch,
+        opt_batch,
+        max_batch,
+        **kwargs,
+    ):
         """Skip upstream model evaluation when engine exists and refit is off."""
         if refit:
             return ["model"]
         from .tensorrt_convert import _make_profile_desc
+
         if static_shapes == "static":
             profile_desc = _make_profile_desc(
-                True, batch_size, batch_size, batch_size,
-                height, height, height, width, width, width,
+                True,
+                batch_size,
+                batch_size,
+                batch_size,
+                height,
+                height,
+                height,
+                width,
+                width,
+                width,
                 context_len=context_len,
             )
         else:
             profile_desc = _make_profile_desc(
-                False, min_batch, opt_batch, max_batch,
-                min_height, opt_height, max_height,
-                min_width, opt_width, max_width,
+                False,
+                min_batch,
+                opt_batch,
+                max_batch,
+                min_height,
+                opt_height,
+                max_height,
+                min_width,
+                opt_width,
+                max_width,
                 context_len=context_len,
             )
         if _find_existing_engine(profile_desc) is not None:
@@ -759,7 +817,7 @@ class TensorRTLoaderAuto:
                     width,
                     width,
                     width,
-                    context_len,
+                    1,
                     context_len,
                     context_len,
                     num_video_frames=0,
@@ -788,8 +846,11 @@ class TensorRTLoaderAuto:
                 )
 
             _write_meta_sidecar(
-                engine_path, model_type, derived_model_name or filename_prefix,
-                profile_desc, refit,
+                engine_path,
+                model_type,
+                derived_model_name or filename_prefix,
+                profile_desc,
+                refit,
             )
 
         # Build info JSON
@@ -838,7 +899,9 @@ class TensorRTLoaderAuto:
                 )
                 _send_trt_progress("cached")
                 return (_refit_cache["patcher"], _build_info(engine_path))
-            log.info("Auto: refit cache invalid (persisted engine missing), will re-refit")
+            log.info(
+                "Auto: refit cache invalid (persisted engine missing), will re-refit"
+            )
             _refit_cache["patcher"] = None
 
         if (

@@ -149,6 +149,24 @@ class TrTUnet(TrTEngine):
         for k in inputs:
             shape = inputs[k].shape
             shape = [shape[0] // split_batch] + list(shape[1:])
+            # Validate shape against engine profile
+            try:
+                profile_min, profile_opt, profile_max = (
+                    self.engine.get_tensor_profile_shape(k, 0)
+                )
+                for d, (lo, hi, actual) in enumerate(
+                    zip(profile_min, profile_max, shape)
+                ):
+                    if actual < lo or actual > hi:
+                        raise ValueError(
+                            f"TRT input '{k}' dimension {d}: got {actual}, "
+                            f"engine expects [{lo}..{hi}]. "
+                            f"Full input shape: {list(shape)}, "
+                            f"engine range: {list(profile_min)}..{list(profile_max)}. "
+                            f"Rebuild the engine with matching dimensions."
+                        )
+            except RuntimeError:
+                pass  # Not all tensors have profile shapes (e.g. scalar inputs)
             self.context.set_input_shape(k, shape)
 
     def __call__(
@@ -440,7 +458,9 @@ class TensorRTRefitLoader:
                     "Refit: cache hit (evicted, reloading refitted engine on demand)"
                 )
                 return (_refit_loader_cache["patcher"],)
-            trt_logger.info("Refit: cache invalid (persisted engine missing), will re-refit")
+            trt_logger.info(
+                "Refit: cache invalid (persisted engine missing), will re-refit"
+            )
             _refit_loader_cache["patcher"] = None
 
         pbar = comfy.utils.ProgressBar(4)
