@@ -316,6 +316,7 @@ def build_unet_engine(
     for shape in inputs_shapes_opt:
         inputs += (torch.zeros(shape, device=device, dtype=dtype),)
 
+    comfy.model_management.throw_exception_if_processing_interrupted()
     os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
     with _disable_comfy_cast(unet):
         torch.onnx.export(
@@ -332,6 +333,8 @@ def build_unet_engine(
 
     comfy.model_management.unload_all_models()
     comfy.model_management.soft_empty_cache()
+
+    comfy.model_management.throw_exception_if_processing_interrupted()
 
     # TRT conversion
     trt_logger = trt.Logger(trt.Logger.INFO)
@@ -382,6 +385,8 @@ def build_unet_engine(
 
     serialized_engine = builder.build_serialized_network(network, config)
     if serialized_engine is None:
+        # Check if this was due to user interrupt
+        comfy.model_management.throw_exception_if_processing_interrupted()
         raise RuntimeError("TensorRT engine build failed — serialized_engine is None.")
 
     os.makedirs(os.path.dirname(output_engine_path), exist_ok=True)
@@ -477,6 +482,10 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
                 self._active_phases[phase_name]["tq"].update(
                     step - self._active_phases[phase_name]["tq"].n
                 )
+            # Check ComfyUI interrupt signal (user cancelled the workflow)
+            if comfy.model_management.processing_interrupted():
+                log.info("TRT build interrupted by user")
+                return False
             return self._step_result
         except KeyboardInterrupt:
             # There is no need to propagate this exception to TensorRT. We can simply cancel the build.
