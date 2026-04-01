@@ -289,7 +289,13 @@ class TensorRTLoader:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
     CATEGORY = "TensorRT"
-    DESCRIPTION = "Load a pre-built TensorRT engine as a UNet model. Select the model architecture to match the engine."
+    DESCRIPTION = (
+        "Load a pre-built TensorRT engine as a UNet model. "
+        "The engine is managed by ComfyUI's VRAM system — it loads to GPU on demand "
+        "and unloads when other models need space. "
+        "Input shapes are validated before inference — mismatches error immediately "
+        "instead of producing corrupt output."
+    )
 
     def load_unet(self, unet_name, model_type):
         unet_path = folder_paths.get_full_path("tensorrt", unet_name)
@@ -407,7 +413,8 @@ class TensorRTRefitLoader:
                 "source_model": (
                     "MODEL",
                     {
-                        "tooltip": "Source model with LoRA/weights applied. Its weights will be written into the TRT engine."
+                        "tooltip": "Source model with LoRA/weights applied. Its weights are refitted into the TRT engine. "
+                        "Results are cached by patches_uuid — if LoRAs haven't changed, refit is skipped entirely."
                     },
                 ),
             },
@@ -418,8 +425,10 @@ class TensorRTRefitLoader:
     CATEGORY = "TensorRT"
     DESCRIPTION = (
         "Load a refit-enabled TRT engine and update its weights from a source "
-        "model (e.g. checkpoint + LoRA). The engine must have been built with "
-        "enable_refit=True. This is much faster than rebuilding the engine."
+        "model (e.g. checkpoint + LoRA). Much faster than rebuilding (~13s vs 5-10 min). "
+        "Refitted engines are cached to disk — repeated runs with the same LoRAs "
+        "skip refitting entirely, even after VRAM eviction. "
+        "Cache is invalidated automatically when LoRA patches change."
     )
 
     @classmethod

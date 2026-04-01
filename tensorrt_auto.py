@@ -405,8 +405,12 @@ class TensorRTLoaderAuto:
                     "MODEL",
                     {
                         "tooltip": "Source model from a checkpoint loader, optionally with LoRAs applied. "
-                        "With refit=True, only base weights are used for building — LoRAs are applied at load time. "
-                        "With refit=False, all applied weights (including LoRAs) are baked into the engine permanently.",
+                        "The checkpoint name is auto-detected by walking the graph back through "
+                        "LoRA loaders, model merges, etc. to find the source CheckpointLoaderSimple. "
+                        "Engines are matched to checkpoints by name — different checkpoints with "
+                        "the same resolution get separate engines. "
+                        "With refit=True, only base weights are used for building — LoRAs are refitted at load time. "
+                        "With refit=False, all applied weights (including LoRAs) are baked in permanently.",
                     },
                 ),
                 "model_type": (
@@ -419,7 +423,10 @@ class TensorRTLoaderAuto:
                     "STRING",
                     {
                         "default": "AUTO_{modelname}",
-                        "tooltip": "Engine filename prefix. {modelname} is auto-resolved from the upstream checkpoint loader.",
+                        "tooltip": "Engine filename prefix. {modelname} is auto-resolved from the upstream "
+                        "checkpoint loader by walking back through the graph. "
+                        "The prefix is only used for naming new engines — existing engines are matched "
+                        "by checkpoint name and profile, not by prefix.",
                     },
                 ),
                 "refit": (
@@ -427,7 +434,9 @@ class TensorRTLoaderAuto:
                     {
                         "default": True,
                         "tooltip": "When enabled, the engine is built from base weights only — LoRA/patch deltas "
-                        "are applied into the TRT engine at load time (~13s for SDXL). "
+                        "are refitted into the TRT engine at load time (~13s for SDXL). "
+                        "Refitted engines are cached to disk so subsequent runs skip refitting "
+                        "even after VRAM eviction. Cache is invalidated when LoRA patches change. "
                         "When disabled, all applied weights (including LoRAs) are baked into the engine permanently.",
                     },
                 ),
@@ -435,8 +444,8 @@ class TensorRTLoaderAuto:
                     ["build", "error"],
                     {
                         "default": "build",
-                        "tooltip": "What to do when no matching engine exists. "
-                        "'build': automatically build the engine (5-10 min for SDXL), shows build configuration widgets. "
+                        "tooltip": "What to do when no matching engine exists for this checkpoint + profile. "
+                        "'build': automatically build the engine (5-10 min for SDXL). "
                         "'error': raise an error — use this when engines are pre-built externally.",
                     },
                 ),
@@ -444,7 +453,10 @@ class TensorRTLoaderAuto:
                     ["static", "dynamic"],
                     {
                         "default": "static",
-                        "tooltip": "Static: fixed dimensions, best performance. Dynamic: flexible resolution range, slightly slower.",
+                        "tooltip": "Static: fixed height/width/batch, best performance. "
+                        "Dynamic: flexible resolution range, slightly slower. "
+                        "Context length is always dynamic regardless of this setting — "
+                        "prompts shorter than context_len will work without rebuilding.",
                     },
                 ),
                 "context_len": (
@@ -454,8 +466,9 @@ class TensorRTLoaderAuto:
                         "min": 1,
                         "max": 128,
                         "step": 1,
-                        "tooltip": "CLIP context multiplier. 4 = 308 tokens (SDXL with prompt weighting). "
-                        "1 = 77 tokens (standard). Must cover your longest prompt or inference will fail.",
+                        "tooltip": "Maximum CLIP context multiplier. 4 = up to 308 tokens (SDXL with prompt weighting). "
+                        "1 = up to 77 tokens (standard). Context is always dynamic — shorter prompts work fine, "
+                        "but prompts exceeding this limit will error. Changing this value requires a rebuild.",
                     },
                 ),
                 # Static shape widgets
@@ -586,10 +599,12 @@ class TensorRTLoaderAuto:
                     {
                         "default": "disabled",
                         "tooltip": "Disk management for models/tensorrt/auto/. "
+                        "Eviction order: refit cache (expendable, ~13s to rebuild) is purged first, "
+                        "then oldest base engines (expensive, 5-10 min to rebuild) by FIFO. "
                         "'disabled': no eviction. "
-                        "'max_disk_usage': evict oldest engines when auto/ exceeds threshold_gb. "
-                        "'min_disk_free': evict oldest engines when free space on the auto/ drive drops below threshold_gb. "
-                        "Only real files (not symlinks) are evicted.",
+                        "'max_disk_usage': evict when auto/ total size exceeds threshold_gb. "
+                        "'min_disk_free': evict when free space on the auto/ drive drops below threshold_gb. "
+                        "Only real files are evicted — symlinked engines are excluded.",
                     },
                 ),
                 "threshold_gb": (
@@ -600,7 +615,7 @@ class TensorRTLoaderAuto:
                         "max": 1000.0,
                         "step": 1.0,
                         "tooltip": "Threshold in GB. "
-                        "For 'max_disk_usage': maximum size of models/tensorrt/auto/. "
+                        "For 'max_disk_usage': maximum total size of models/tensorrt/auto/. "
                         "For 'min_disk_free': minimum free space on the drive where auto/ lives. "
                         "Only real files count — symlinked engines are excluded from size calculation and eviction.",
                     },
@@ -681,7 +696,10 @@ class TensorRTLoaderAuto:
     DESCRIPTION = (
         "All-in-one TensorRT UNet: auto-builds engine if absent, loads it, "
         "and optionally refits LoRA weights from the source model. "
-        "Engines are stored in models/tensorrt/auto/ with optional FIFO disk management."
+        "Engines are matched by checkpoint name + profile (not filename prefix). "
+        "Refitted engines are cached to disk so VRAM eviction doesn't require re-refitting. "
+        "Context length is always dynamic — shorter prompts work without rebuilding. "
+        "Outputs a MODEL and an info JSON string with engine metadata."
     )
 
     def execute(

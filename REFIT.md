@@ -34,15 +34,15 @@ The 722 MatMul weights are the attention projections (to_q, to_k, to_v, to_out, 
 
 ### How long do refitted engines persist?
 
-The refitted engine lives in VRAM until evicted by ComfyUI's memory manager (e.g. when loading a different model). The `.engine` file on disk is unchanged — it keeps the original base weights. Each workflow execution re-refits (~13 seconds).
+Refitted engines are cached to disk in a `.refit_cache/` directory alongside the base engine. After the first refit, subsequent runs with the same LoRA patches skip refitting entirely — even after VRAM eviction. The cache is invalidated automatically when LoRA patches change (detected via `patches_uuid`).
 
-### Can the models be evicted to RAM instead of the void?
+### What happens on VRAM eviction?
 
-Not yet — VRAM eviction currently destroys the refitted engine. Keeping it in RAM to survive eviction is planned.
+When ComfyUI's memory manager evicts the TRT engine (e.g. to load a VAE), the refitted engine is reloaded from the `.refit_cache/` file on the next run. No re-refitting needed — just a ~2-3s deserialize.
 
-### Can refitted models be saved to and reloaded from disk?
+### What about disk space?
 
-Not yet. Saving a refitted engine as a new `.engine` file (loadable without re-refitting) is planned.
+The `.refit_cache/` directory contains a copy of the refitted engine (~5 GB for SDXL). Disk management evicts refit cache files first (expendable, ~13s to rebuild) before touching base engines (5-10 min to rebuild).
 
 ## Setup (one-time per engine)
 
@@ -52,9 +52,21 @@ Not yet. Saving a refitted engine as a new `.engine` file (loadable without re-r
 
 The resulting `.engine` and `.weight_map.json` files are permanent and survive reboots.
 
-**Important:** Build with a context length that covers your longest prompt. SDXL with prompt weighting (e.g. A1111-style `(word:1.2)`) can produce up to 308 tokens (77x4). If the engine was built with context_len=77 and you send 308 tokens, it will fail with a shape mismatch error.
+**Context length:** Set `context_len` to cover your longest prompt (e.g. 4 = 308 tokens for SDXL with prompt weighting). Context is always dynamic — shorter prompts work fine, but exceeding the limit will error. Changing context_len requires a rebuild.
 
 ## Usage (per-LoRA, fast)
+
+### Option A: TensorRT Loader Auto (recommended)
+
+1. Load checkpoint → Load LoRA(s) → **MODEL** output
+2. Connect MODEL to **TensorRT Loader Auto** with `refit=True`
+3. First run: auto-builds engine (5-10 min) then refits (~13s)
+4. Subsequent runs: loads cached engine, skips refit if LoRAs unchanged
+5. Change LoRA/strength/stack → rerun → ~13 seconds for refit
+
+The Auto node handles building, loading, matching, and caching automatically.
+
+### Option B: TensorRT Refit Loader (manual)
 
 1. Load checkpoint → Load LoRA(s) → **MODEL** output
 2. Connect MODEL to **TensorRT Refit Loader** (`source_model`)
@@ -66,12 +78,11 @@ CLIP and text encoding still use the normal LoRA pipeline — only the UNet is T
 
 ## Limitations
 
-- **Static dimensions** — engine is locked to the resolution, batch size, and context length it was built with (or the dynamic range, for dynamic engines)
+- **Static dimensions** — engine is locked to the resolution and batch size it was built with (or the dynamic range, for dynamic engines). Context length is always dynamic.
 - **Refit flag required** — engine must be built with `enable_refit: True`. Slightly larger and marginally slower than non-refit engines due to fewer weight fusion optimizations
 - **Weight-space LoRAs only** — standard LoRA that patches linear/conv layers. Anything that changes graph topology (new layers, different architecture) won't work
 - **Only SDXL tested** — the mapping logic is generic, but SD1.5/SD3/Flux/etc. are untested
 - **Only static engines tested** — dynamic profile engines are untested
-- **Re-refits on every run** — the refitted engine is not persisted to disk or RAM yet
 
 ## FAQ
 

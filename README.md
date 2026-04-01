@@ -57,16 +57,14 @@ TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL)
   - [x] ~~UNet/VAE/Refit engine dropdowns filtered~~
   - [x] ~~DESCRIPTION docstrings and widget tooltips on all nodes~~
   - [x] ~~`{modelname}` placeholder and auto-pathing for UNet and VAE builders~~
-  - [ ] Merged builder + loader for UNet — auto-build engine if not present, with build parameters on the loader node. Maybe split off predetermined build approval or rejection config to a TensorRT Build Config node?
+  - [x] ~~Merged builder + loader for UNet~~ — **TensorRT Loader Auto** node (see below)
 - [ ] **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
 
 #### Done
 
 - [x] **LoRA Refit** — working for SDXL. ~13s refit vs ~5-10 min rebuild. See [REFIT.md](REFIT.md). ([#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1))
-
-#### Blocked
-
-- [ ] **Refit persistence** — serialize refitted engine to RAM or disk (avoids re-refit after VRAM eviction)
+- [x] **Refit persistence** — refitted engines are cached to disk (`.refit_cache/`). VRAM eviction no longer requires re-refitting — the cached engine reloads on demand. Cache is invalidated automatically when LoRA patches change.
+- [x] **TensorRT Loader Auto** — all-in-one node: auto-builds engine if absent, loads it, and optionally refits LoRA weights. Engines matched by checkpoint name + profile (not filename). See section below.
 
 #### Shelved
 
@@ -198,10 +196,22 @@ TensorRT Engines are loaded using the TensorRT Loader node.
 
 ![](readme_images/image1.png)
 
+### 8. TensorRT Loader Auto
+
+All-in-one node that replaces the manual build → load → refit workflow:
+
+- **Auto-build** — If no matching engine exists, builds one automatically (5-10 min for SDXL). Set `on_missing` to `error` to skip building and fail fast.
+- **Checkpoint-aware matching** — Engines are matched by checkpoint name (from `.meta.json` sidecar) + profile shape. Different checkpoints with the same resolution get separate engines. The checkpoint name is auto-detected by walking the workflow graph back through LoRA loaders, model merges, etc.
+- **LoRA refit** — With `refit=True`, base weights are used for building and LoRA patches are applied at load time (~13s). Refitted engines are cached to disk so subsequent runs skip refitting even after VRAM eviction.
+- **Dynamic context** — Context length is always dynamic regardless of the `static_shapes` setting. Shorter prompts work without rebuilding; only prompts exceeding `context_len` will error.
+- **Disk management** — Optional FIFO eviction with two modes: `max_disk_usage` (cap total auto/ size) or `min_disk_free` (maintain minimum free space). Refit cache is purged first (expendable, ~13s to rebuild), base engines only as last resort.
+- **Shape validation** — Input shapes are validated against the engine profile before inference. Mismatches error immediately with a clear message instead of producing corrupt output.
+- **Info output** — Outputs a JSON string with engine path, checkpoint name, profile, symlink status, disk usage, and per-engine metadata.
+
 ## Common Issues/Limitations
 
 ComfyUI TensorRT engines are not yet compatible with ControlNets.
-LoRA support via the `TensorRT Refit Loader` node is not yet working — see [#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1).
+LoRA refit can update ~958/1680 weights (norms, biases, convs, and attention projections via ONNX weight map). ~722 attention weights absorbed into fused TRT kernels are mapped via the `.weight_map.json` sidecar. See [#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1) for details.
 
 1.  Add a TensorRT Loader node
 2.  Note, if a TensorRT Engine has been created during a ComfyUI
