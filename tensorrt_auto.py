@@ -1,5 +1,6 @@
 """TensorRT Loader Auto — combined build + load + refit node."""
 
+import datetime
 import json
 import logging
 import os
@@ -92,6 +93,68 @@ def _symlink_into_auto(source, auto_dir):
     return dest
 
 
+def _write_meta_sidecar(engine_path, model_type, model_name, profile_desc, refit):
+    """Write a .meta.json sidecar alongside an engine file."""
+    meta_path = engine_path.replace(".engine", ".meta.json")
+    meta = {
+        "model_type": model_type,
+        "model_name": model_name,
+        "profile_desc": profile_desc,
+        "refit": refit,
+        "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    try:
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+    except OSError as e:
+        log.warning("Auto: failed to write meta sidecar: %s", e)
+
+
+def _read_meta_sidecar(engine_path):
+    """Read .meta.json sidecar if it exists, else return empty dict."""
+    meta_path = engine_path.replace(".engine", ".meta.json")
+    if not os.path.isfile(meta_path):
+        return {}
+    try:
+        with open(meta_path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _collect_auto_models_info(auto_dir):
+    """Gather info on all engines in the auto directory."""
+    models = []
+    if not os.path.isdir(auto_dir):
+        return models
+    for f in sorted(os.listdir(auto_dir)):
+        if not f.endswith(".engine"):
+            continue
+        path = os.path.join(auto_dir, f)
+        is_link = os.path.islink(path)
+        try:
+            stat = os.stat(path)
+            disk_size = stat.st_size
+            created_at = datetime.datetime.fromtimestamp(
+                stat.st_mtime, tz=datetime.timezone.utc
+            ).isoformat()
+        except OSError:
+            disk_size = 0
+            created_at = None
+        meta = _read_meta_sidecar(path)
+        models.append(
+            {
+                "filename": f,
+                "path": path,
+                "is_symlink": is_link,
+                "disk_size_bytes": disk_size if not is_link else 0,
+                "created_at": created_at,
+                **meta,
+            }
+        )
+    return models
+
+
 def _find_existing_engine(profile_desc):
     """Search for a matching engine by profile, checking auto/ first, then output/tensorrt/unet/.
 
@@ -120,13 +183,12 @@ def _find_existing_engine(profile_desc):
     return None
 
 
-def _fifo_evict(auto_dir, max_bytes, estimated_new_bytes=0):
-    """Evict oldest real (non-symlink) engines until under budget."""
-    if not os.path.isdir(auto_dir):
-        return
-
+def _list_real_engines(auto_dir):
+    """List real (non-symlink) engine files sorted oldest first."""
     entries = []
     total_real = 0
+    if not os.path.isdir(auto_dir):
+        return entries, total_real
     for f in os.listdir(auto_dir):
         if not f.endswith(".engine"):
             continue
@@ -136,22 +198,39 @@ def _fifo_evict(auto_dir, max_bytes, estimated_new_bytes=0):
         size = os.path.getsize(path)
         entries.append((os.path.getmtime(path), path, size))
         total_real += size
-
-    if total_real + estimated_new_bytes <= max_bytes:
-        return
-
-    # Sort oldest first
     entries.sort()
+    return entries, total_real
+
+
+def _evict_engine(path, size):
+    """Remove an engine file and its sidecars."""
+    log.info("Auto: FIFO evicting %s (%.1f MB)", path, size / (1024 * 1024))
+    os.remove(path)
+    for suffix in (".weight_map.json", ".meta.json"):
+        sidecar = path.replace(".engine", suffix)
+        if os.path.isfile(sidecar) and not os.path.islink(sidecar):
+            os.remove(sidecar)
+
+
+def _fifo_evict_max_usage(auto_dir, max_bytes, estimated_new_bytes=0):
+    """Evict oldest real engines until auto/ dir is under max_bytes."""
+    entries, total_real = _list_real_engines(auto_dir)
     for _mtime, path, size in entries:
         if total_real + estimated_new_bytes <= max_bytes:
             break
-        log.info("Auto: FIFO evicting %s (%.1f MB)", path, size / (1024 * 1024))
-        os.remove(path)
-        # Also remove sidecar
-        sidecar = path.replace(".engine", ".weight_map.json")
-        if os.path.isfile(sidecar) and not os.path.islink(sidecar):
-            os.remove(sidecar)
+        _evict_engine(path, size)
         total_real -= size
+
+
+def _fifo_evict_min_free(auto_dir, min_free_bytes, estimated_new_bytes=0):
+    """Evict oldest real engines until drive has min_free_bytes free."""
+    entries, _ = _list_real_engines(auto_dir)
+    for _mtime, path, size in entries:
+        stat = os.statvfs(auto_dir)
+        free = stat.f_bavail * stat.f_frsize
+        if free - estimated_new_bytes >= min_free_bytes:
+            break
+        _evict_engine(path, size)
 
 
 def _do_refit(engine, unet_path, source_model, model_type):
@@ -444,23 +523,27 @@ class TensorRTLoaderAuto:
                 ),
                 # Disk management
                 "disk_management": (
-                    "BOOLEAN",
+                    ["disabled", "max_disk_usage", "min_disk_free"],
                     {
-                        "default": False,
-                        "tooltip": "Enable automatic disk usage management for models/tensorrt/auto/. "
-                        "Only engines built by this node are affected — manually built engines in other directories are never touched. "
-                        "When the auto directory exceeds the size limit, the oldest engines are evicted (FIFO).",
+                        "default": "disabled",
+                        "tooltip": "Disk management for models/tensorrt/auto/. "
+                        "'disabled': no eviction. "
+                        "'max_disk_usage': evict oldest engines when auto/ exceeds threshold_gb. "
+                        "'min_disk_free': evict oldest engines when free space on the auto/ drive drops below threshold_gb. "
+                        "Only real files (not symlinks) are evicted.",
                     },
                 ),
-                "max_disk_usage_gb": (
+                "threshold_gb": (
                     "FLOAT",
                     {
                         "default": 20.0,
                         "min": 1.0,
                         "max": 1000.0,
                         "step": 1.0,
-                        "tooltip": "Maximum disk usage in GB for models/tensorrt/auto/. "
-                        "Only real files count — symlinked engines from other directories are excluded from both size calculation and eviction.",
+                        "tooltip": "Threshold in GB. "
+                        "For 'max_disk_usage': maximum size of models/tensorrt/auto/. "
+                        "For 'min_disk_free': minimum free space on the drive where auto/ lives. "
+                        "Only real files count — symlinked engines are excluded from size calculation and eviction.",
                     },
                 ),
             },
@@ -475,7 +558,8 @@ class TensorRTLoaderAuto:
         # Always re-execute — internal caches handle skipping redundant work
         return float("NaN")
 
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "info")
     FUNCTION = "execute"
     CATEGORY = "TensorRT"
     DESCRIPTION = (
@@ -506,11 +590,12 @@ class TensorRTLoaderAuto:
         opt_batch,
         max_batch,
         disk_management,
-        max_disk_usage_gb,
+        threshold_gb,
         prompt=None,
         unique_id=None,
     ):
         global _refit_cache, _engine_cache
+        import comfy.model_management
         import comfy.utils
         from .tensorrt_convert import (
             _derive_model_name,
@@ -578,11 +663,16 @@ class TensorRTLoaderAuto:
             log.info("Auto: building engine — this takes 5-10 minutes for SDXL...")
             _send_trt_progress("building")
 
-            if disk_management:
-                # Estimate ~2GB for SDXL static engine
-                _fifo_evict(
+            if disk_management == "max_disk_usage":
+                _fifo_evict_max_usage(
                     auto_dir,
-                    int(max_disk_usage_gb * 1024**3),
+                    int(threshold_gb * 1024**3),
+                    estimated_new_bytes=2 * 1024**3,
+                )
+            elif disk_management == "min_disk_free":
+                _fifo_evict_min_free(
+                    auto_dir,
+                    int(threshold_gb * 1024**3),
                     estimated_new_bytes=2 * 1024**3,
                 )
 
@@ -627,6 +717,26 @@ class TensorRTLoaderAuto:
                     enable_refit=True,
                 )
 
+            _write_meta_sidecar(
+                engine_path, model_type, filename_prefix, profile_desc, refit
+            )
+
+        # Build info JSON
+        def _build_info(ep):
+            info = {
+                "engine_path": ep,
+                "is_symlink": os.path.islink(ep),
+                "engine_size_bytes": os.path.getsize(ep) if os.path.isfile(ep) else 0,
+                **_read_meta_sidecar(ep),
+            }
+            if disk_management != "disabled":
+                auto_models = _collect_auto_models_info(auto_dir)
+                info["current_disk_usage_bytes"] = sum(
+                    m["disk_size_bytes"] for m in auto_models
+                )
+                info["auto_models"] = auto_models
+            return json.dumps(info, indent=2)
+
         # Step 2: Check caches
         pbar.update_absolute(1, 4)
         has_patches = refit and hasattr(model, "patches") and len(model.patches) > 0
@@ -639,24 +749,41 @@ class TensorRTLoaderAuto:
             and _refit_cache["engine_path"] == engine_path
             and _refit_cache["patcher"] is not None
         ):
-            log.info("Auto: refit cache hit (patches_uuid unchanged), skipping refit")
-            _send_trt_progress("cached")
-            return (_refit_cache["patcher"],)
+            # Check if engine was evicted from VRAM by model manager
+            cached_unet = _refit_cache["patcher"].model.diffusion_model
+            if cached_unet.engine is not None:
+                log.info(
+                    "Auto: refit cache hit (patches_uuid unchanged), skipping refit"
+                )
+                _send_trt_progress("cached")
+                return (_refit_cache["patcher"], _build_info(engine_path))
+            log.info(
+                "Auto: refit cache stale (engine evicted from VRAM), will reload+refit"
+            )
+            _refit_cache["patcher"] = None
 
         if (
             not has_patches
             and _engine_cache["engine_path"] == engine_path
             and _engine_cache["patcher"] is not None
         ):
-            log.info("Auto: engine cache hit (no refit needed)")
-            _send_trt_progress("cached")
-            return (_engine_cache["patcher"],)
+            cached_unet = _engine_cache["patcher"].model.diffusion_model
+            if cached_unet.engine is not None:
+                log.info("Auto: engine cache hit (no refit needed)")
+                _send_trt_progress("cached")
+                return (_engine_cache["patcher"], _build_info(engine_path))
+            log.info("Auto: engine cache stale (engine evicted from VRAM), will reload")
+            _engine_cache["patcher"] = None
 
         # Step 3: Load engine
         pbar.update_absolute(2, 4)
         _send_trt_progress("loading")
         import torch
 
+        # Free VRAM before probe — TrTUnet.__init__ deserializes the engine
+        # to read device_memory_size, which needs the full engine in GPU memory.
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
         torch.cuda.empty_cache()
         unet = TrTUnet(engine_path)
         model_shell = _create_model_for_type(model_type, unet)
@@ -667,22 +794,10 @@ class TensorRTLoaderAuto:
         if has_patches:
             log.info("Auto: refitting with LoRA patches...")
             _send_trt_progress("refitting")
-            import tensorrt as trt
 
-            trt_runtime = trt.Runtime(trt.Logger(trt.Logger.INFO))
-            with open(engine_path, "rb") as f:
-                engine = trt_runtime.deserialize_cuda_engine(f.read())
-            if engine is None:
-                raise RuntimeError(f"Failed to deserialize engine: {engine_path}")
-
-            _do_refit(engine, engine_path, model, model_type)
-
-            # Create new patcher from refitted engine
-            from .tensorrt_loader import TrTUnet as _TrTUnet
-
-            unet = _TrTUnet.from_engine(engine)
-            model_shell = _create_model_for_type(model_type, unet)
-            patcher = _wrap_trt_patcher(model_shell, unet)
+            # Refit in-place — preserves engine_path so ON_LOAD can reload from disk
+            unet._load()
+            _do_refit(unet.engine, engine_path, model, model_type)
 
             _refit_cache["patches_uuid"] = current_uuid
             _refit_cache["engine_path"] = engine_path
@@ -693,4 +808,4 @@ class TensorRTLoaderAuto:
 
         pbar.update_absolute(4, 4)
         _send_trt_progress("done")
-        return (patcher,)
+        return (patcher, _build_info(engine_path))

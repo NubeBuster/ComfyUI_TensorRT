@@ -40,6 +40,13 @@ trt.init_libnvinfer_plugins(None, "")
 logger = trt.Logger(trt.Logger.INFO)
 runtime = trt.Runtime(logger)
 
+# Refit loader cache: skip redundant refit when patches haven't changed
+_refit_loader_cache = {
+    "patches_uuid": None,
+    "unet_name": None,
+    "patcher": None,
+}
+
 
 def trt_datatype_to_torch(datatype):
     if datatype == trt.float16:
@@ -343,7 +350,8 @@ def _wrap_trt_patcher(model, unet):
         p.model.model_loaded_weight_memory = trt_memory
 
     def _on_detach(p, _unpatch_all):
-        pass
+        p.model.diffusion_model._unload()
+        p.model.model_loaded_weight_memory = 0
 
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach)
@@ -396,7 +404,13 @@ class TensorRTRefitLoader:
         "enable_refit=True. This is much faster than rebuilding the engine."
     )
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
     def load_and_refit(self, unet_name, model_type, source_model):
+        global _refit_loader_cache
+
         if unet_name == _NO_REFIT_ENGINES:
             raise ValueError(
                 "No refit-enabled TRT engines found. Build an engine with "
@@ -405,6 +419,23 @@ class TensorRTRefitLoader:
         unet_path = folder_paths.get_full_path("tensorrt", unet_name)
         if not os.path.isfile(unet_path):
             raise FileNotFoundError(f"File {unet_path} does not exist")
+
+        # Cache check: skip refit if patches haven't changed
+        current_uuid = getattr(source_model, "patches_uuid", None)
+        if (
+            current_uuid is not None
+            and _refit_loader_cache["patches_uuid"] == current_uuid
+            and _refit_loader_cache["unet_name"] == unet_name
+            and _refit_loader_cache["patcher"] is not None
+        ):
+            cached_unet = _refit_loader_cache["patcher"].model.diffusion_model
+            if cached_unet.engine is not None:
+                trt_logger.info(
+                    "Refit: cache hit (patches_uuid unchanged), skipping refit"
+                )
+                return (_refit_loader_cache["patcher"],)
+            trt_logger.info("Refit: cache stale (engine evicted), will reload+refit")
+            _refit_loader_cache["patcher"] = None
 
         pbar = comfy.utils.ProgressBar(4)
 
@@ -485,22 +516,17 @@ class TensorRTRefitLoader:
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
 
-        # --- Step 2: Deserialize the TRT engine ---
+        # --- Step 2: Load TRT engine (preserves engine_path for reload) ---
         pbar.update_absolute(1, 4)
-        trt_logger.info(f"Refit: deserializing engine: {unet_path}")
+        trt_logger.info(f"Refit: loading engine: {unet_path}")
         torch.cuda.empty_cache()
-        with open(unet_path, "rb") as f:
-            engine = runtime.deserialize_cuda_engine(f.read())
-        if engine is None:
-            raise RuntimeError(
-                f"Failed to deserialize TensorRT engine: {unet_path}\n"
-                "The engine file may be corrupt or built with an incompatible "
-                "TensorRT version."
-            )
+        unet = TrTUnet(unet_path)
+        unet._load()
 
-        # --- Step 3: Refit weights ---
+        # --- Step 3: Refit weights in-place ---
         pbar.update_absolute(2, 4)
         trt_logger.info("Refit: applying weights to engine...")
+        engine = unet.engine
         refitter = trt.Refitter(engine, logger)
 
         trt_weight_names = set(refitter.get_all_weights())
@@ -602,17 +628,20 @@ class TensorRTRefitLoader:
         success = refitter.refit_cuda_engine()
         del refitter, cpu_weights
         if not success:
-            del engine
             raise RuntimeError(
                 "TensorRT engine refit failed. Check the log for details."
             )
         trt_logger.info("Refit: engine weights updated successfully")
 
-        # --- Step 4: Create model patcher ---
+        # --- Step 4: Create model patcher (engine_path preserved for reload) ---
         pbar.update_absolute(3, 4)
-        unet = TrTUnet.from_engine(engine)
         model = _create_model_for_type(model_type, unet)
         patcher = _wrap_trt_patcher(model, unet)
+
+        _refit_loader_cache["patches_uuid"] = current_uuid
+        _refit_loader_cache["unet_name"] = unet_name
+        _refit_loader_cache["patcher"] = patcher
+
         pbar.update_absolute(4, 4)
         return (patcher,)
 

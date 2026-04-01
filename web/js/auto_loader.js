@@ -20,7 +20,7 @@ const DYNAMIC_WIDGETS = [
 // Widgets visible when on_missing is "build" (plus static/dynamic subsets)
 const BUILD_ONLY_WIDGETS = ["static_shapes", "context_len", "disk_management"];
 
-const DISK_WIDGETS = ["max_disk_usage_gb"];
+const DISK_WIDGETS = ["threshold_gb"];
 
 function setWidgetHidden(widget, hidden) {
     if (widget._originalType === undefined) {
@@ -45,7 +45,7 @@ function updateWidgetVisibility(node) {
 
     const buildEnabled = (buildWidget?.value ?? "build") === "build";
     const isStatic = (staticWidget?.value ?? "static") === "static";
-    const diskEnabled = diskWidget?.value ?? false;
+    const diskEnabled = (diskWidget?.value ?? "disabled") !== "disabled";
 
     for (const widget of node.widgets || []) {
         if (BUILD_ONLY_WIDGETS.includes(widget.name)) {

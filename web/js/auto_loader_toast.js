@@ -213,6 +213,16 @@ function dismiss() {
     }
 }
 
+// Phase colors: building=blue, refitting=NVIDIA green, done=green, default=NVIDIA green
+const PHASE_COLORS = {
+    searching:  "#76B900",
+    building:   "#4A9EFF",
+    loading:    "#76B900",
+    refitting:  "#76B900",
+    done:       "#4CAF50",
+    cached:     "#4CAF50",
+};
+
 const PHASES = {
     searching:  { text: "Searching for engine\u2026",              pct: 5  },
     building:   { text: "Building TRT engine (5\u201310 min)\u2026", pct: 10 },
@@ -239,8 +249,11 @@ app.registerExtension({
                 dismissTimer = null;
             }
 
+            const color = PHASE_COLORS[phase] || "#76B900";
+            toast.querySelector(".toast-title").style.color = color;
             toast.querySelector(".toast-stage").textContent = info.text;
             toast.querySelector(".toast-bar-fill").style.width = `${info.pct}%`;
+            toast.querySelector(".toast-bar-fill").style.background = color;
 
             if (phase === "done" || phase === "cached") {
                 toast.classList.add("done");
