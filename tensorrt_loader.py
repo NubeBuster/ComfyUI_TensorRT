@@ -1,5 +1,6 @@
 # Put this in the custom_nodes folder, put your tensorrt engine files in ComfyUI/models/tensorrt/ (you will have to create the directory)
 
+import json
 import re
 import torch
 import os
@@ -491,63 +492,84 @@ class TensorRTRefitLoader:
         refitter = trt.Refitter(engine, logger)
 
         trt_weight_names = set(refitter.get_all_weights())
-        # Log TRT weight name samples for debugging key mapping
-        trt_samples = sorted(trt_weight_names)[:10]
-        trt_logger.info(
-            f"Refit: TRT has {len(trt_weight_names)} weights, samples: {trt_samples}"
-        )
+        trt_logger.info(f"Refit: TRT has {len(trt_weight_names)} refittable weights")
         if not trt_weight_names:
             del refitter, engine
             raise RuntimeError(
                 "Engine has no refittable weights. Was it built with enable_refit=True?"
             )
 
+        # Load ONNX weight name mapping (maps onnx::MatMul_* -> pytorch keys)
+        weight_map_path = unet_path.replace(".engine", ".weight_map.json")
+        onnx_weight_map = {}
+        if os.path.isfile(weight_map_path):
+            with open(weight_map_path) as f:
+                onnx_weight_map = json.load(f)
+            trt_logger.info(
+                f"Refit: loaded weight map with {len(onnx_weight_map)} entries"
+            )
+        else:
+            trt_logger.warning(
+                "Refit: no .weight_map.json sidecar found — "
+                "onnx::* weights will not be mapped to LoRA keys. "
+                "Rebuild the engine to generate the mapping."
+            )
+
+        import numpy as np
+
         matched = 0
         matched_patched = 0
         matched_base = 0
         missing_in_trt = 0
+        mapped_via_onnx = 0
         for trt_name in trt_weight_names:
+            via_onnx = False
             # TRT weight names have "unet." prefix from the ONNX export wrapper
             if trt_name.startswith("unet."):
                 pytorch_key = trt_name[len("unet.") :]
+            elif trt_name in onnx_weight_map:
+                pytorch_key = onnx_weight_map[trt_name]
+                via_onnx = True
+                mapped_via_onnx += 1
             else:
                 pytorch_key = trt_name
 
             if pytorch_key not in cpu_weights:
                 trt_logger.debug(
-                    f"Refit: TRT weight '{trt_name}' has no match in source "
-                    f"model (may be fused/optimized) — skipping"
+                    f"Refit: TRT weight '{trt_name}' -> '{pytorch_key}' "
+                    f"has no match in source model — skipping"
                 )
                 missing_in_trt += 1
                 continue
 
-            refitter.set_named_weights(trt_name, trt.Weights(cpu_weights[pytorch_key]))
+            w = cpu_weights[pytorch_key]
+            # ONNX MatMul weights need transposition: PyTorch nn.Linear stores
+            # [out, in] but ONNX MatMul expects [in, out] as the B matrix.
+            if via_onnx and "MatMul" in trt_name and w.ndim == 2:
+                w = np.ascontiguousarray(w.T)
+
+            refitter.set_named_weights(trt_name, trt.Weights(w))
             matched += 1
             if pytorch_key in patched_keys:
                 matched_patched += 1
             else:
                 matched_base += 1
 
-        # Log patched keys that did NOT match any TRT weight
-        trt_keys_stripped = {
-            (n[len("unet.") :] if n.startswith("unet.") else n)
-            for n in trt_weight_names
-        }
-        patched_not_mapped = patched_keys - trt_keys_stripped
+        # Build the set of all pytorch keys reachable via TRT weight mapping
+        all_mapped_keys = set()
+        for trt_name in trt_weight_names:
+            if trt_name.startswith("unet."):
+                all_mapped_keys.add(trt_name[len("unet.") :])
+            elif trt_name in onnx_weight_map:
+                all_mapped_keys.add(onnx_weight_map[trt_name])
+
+        patched_not_mapped = patched_keys - all_mapped_keys
         if patched_not_mapped:
             samples = sorted(patched_not_mapped)[:5]
             trt_logger.warning(
                 f"Refit: {len(patched_not_mapped)} LoRA-patched weights NOT "
                 f"mapped to any TRT weight: {samples}"
                 f"{'...' if len(patched_not_mapped) > 5 else ''}"
-            )
-            # Find near-matches for first unmapped key to diagnose naming
-            first_unmapped = sorted(patched_not_mapped)[0]
-            # Search for TRT weights containing the same leaf name
-            leaf = first_unmapped.rsplit(".", 1)[0]  # e.g. "input_blocks.4.1.proj_in"
-            near = [n for n in sorted(trt_weight_names) if leaf in n][:5]
-            trt_logger.info(
-                f"Refit: near-matches in TRT for '{first_unmapped}': {near}"
             )
 
         missing = refitter.get_missing_weights()
@@ -559,7 +581,8 @@ class TensorRTRefitLoader:
 
         trt_logger.info(
             f"Refit: {matched} weights mapped "
-            f"({matched_patched} LoRA-patched, {matched_base} base), "
+            f"({matched_patched} LoRA-patched, {matched_base} base, "
+            f"{mapped_via_onnx} via ONNX map), "
             f"{missing_in_trt} TRT weights without source match, "
             f"{len(missing)} still missing"
         )

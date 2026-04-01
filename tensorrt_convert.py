@@ -1,4 +1,6 @@
+import json
 import logging
+import re
 import torch
 import os
 import shutil
@@ -26,6 +28,67 @@ else:
         [os.path.join(folder_paths.get_output_directory(), "tensorrt")],
         {".engine"},
     )
+
+
+def build_onnx_weight_map(onnx_path):
+    """Build a mapping from ONNX internal weight names to PyTorch state_dict keys.
+
+    During ONNX export, PyTorch attention weights become anonymous tensors named
+    like ``onnx::MatMul_15396``.  The ONNX *node* that consumes each tensor
+    retains the original PyTorch module path in its name, e.g.
+    ``/unet/input_blocks.4.1/transformer_blocks.0/attn1/to_q/MatMul``.
+
+    This function walks the ONNX graph and extracts that mapping so the refit
+    loader can match ``onnx::MatMul_*`` TRT weight names back to LoRA keys.
+
+    Returns a dict ``{onnx_tensor_name: pytorch_key}`` (keys without the
+    ``unet.`` / ``diffusion_model.`` prefix).
+    """
+    import onnx
+
+    model = onnx.load(onnx_path, load_external_data=False)
+
+    weight_map = {}
+    for node in model.graph.node:
+        if not node.name:
+            continue
+        # We care about nodes whose names encode a PyTorch path and whose
+        # inputs include an onnx::* tensor (weight constant).
+        for inp in node.input:
+            if not inp.startswith("onnx::"):
+                continue
+            # Node name looks like /unet/input_blocks.4.1/.../to_q/MatMul
+            # Convert to pytorch key: strip leading /unet/, replace / with .,
+            # drop the trailing op name (MatMul, Add, etc.), append .weight/.bias
+            parts = node.name.strip("/").split("/")
+            # Remove the wrapper module prefix ("unet")
+            if parts and parts[0] == "unet":
+                parts = parts[1:]
+            # Last part is the ONNX op name (MatMul, Add, Mul, etc.)
+            op_suffix = parts[-1] if parts else ""
+            path_parts = parts[:-1]
+            if not path_parts:
+                continue
+            pytorch_key = ".".join(path_parts)
+            # Infer suffix from op type
+            if "MatMul" in op_suffix:
+                pytorch_key += ".weight"
+            elif "Add" in op_suffix:
+                pytorch_key += ".bias"
+            else:
+                pytorch_key += ".weight"
+            # Fix doubled path segments from nn.Sequential containers:
+            # ONNX traces through container AND child, producing e.g.
+            # "to_out.to_out.0" instead of "to_out.0"
+            # Only dedup non-numeric segments (numeric = ModuleList indices)
+            pytorch_key = re.sub(r"\.([a-zA-Z_]\w*)\.\1\.", r".\1.", pytorch_key)
+            weight_map[inp] = pytorch_key
+
+    log.info(
+        "ONNX weight map: %d internal tensor names mapped to PyTorch keys",
+        len(weight_map),
+    )
+    return weight_map
 
 
 class TQDMProgressMonitor(trt.IProgressMonitor):
@@ -498,6 +561,16 @@ class TRT_MODEL_CONVERSION_BASE:
 
         with open(output_trt_engine, "wb") as f:
             f.write(serialized_engine)
+
+        # Save ONNX weight name mapping for refit (before ONNX cleanup)
+        if enable_refit:
+            weight_map = build_onnx_weight_map(output_onnx)
+            map_path = output_trt_engine.replace(".engine", ".weight_map.json")
+            with open(map_path, "w") as f:
+                json.dump(weight_map, f)
+            log.info(
+                "Saved refit weight map: %s (%d entries)", map_path, len(weight_map)
+            )
 
         self._save_timing_cache(config)
 

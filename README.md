@@ -19,11 +19,13 @@ Reduces height/width input step from 64 to 16 for finer-grained resolution contr
 
 Defers TRT engine deserialization to first use and reports true VRAM cost (weights + context scratch) to ComfyUI's memory manager. Previously only context memory (~50 MB) was reported, causing ComfyUI to freely evict and reload multi-GB engines between XY plot iterations.
 
-### 4. LoRA Refit (not working)
+### 4. LoRA Refit
 
-Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. The infrastructure is in place to swap LoRA weights into a pre-built TRT engine in seconds instead of rebuilding. See **[REFIT.md](REFIT.md)** for details.
+Adds `TensorRT Refit Loader` node and `enable_refit` builder flag. Swap any LoRA (or stack of LoRAs) into a pre-built TRT engine in ~13 seconds instead of rebuilding from scratch (~5-10 min). See **[REFIT.md](REFIT.md)** for details.
 
-**Status:** Not usable in practice. TRT fuses attention layers into optimized MHA kernels during engine build, absorbing the weight matrices entirely. The ~722 LoRA-targeted attention weights become non-refittable. See [NubeBuster/ComfyUI_TensorRT#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1) for current progress.
+**How it works:** During engine build, an ONNX weight map sidecar (`.weight_map.json`) is saved alongside the engine. This maps TRT's internal `onnx::MatMul_*` weight names back to PyTorch state_dict keys, covering all 722 attention weights that LoRAs target. At refit time, LoRA-patched weights are extracted from the source model, mapped via the sidecar, transposed from PyTorch `[out, in]` to ONNX `[in, out]` layout, and written into the engine in-place.
+
+**Tested with:** SDXL Pony (babesByStableYogiPony_v60FP16 + LoRA) on RTX 4060 Ti 16GB, static 1024x1024. Output is visually identical to the PyTorch path.
 
 ### 5. VAE TensorRT
 
@@ -58,10 +60,13 @@ TRT-accelerated VAE encode and decode for SD 1.x / SD 2.x / SDXL (AutoencoderKL)
   - [ ] Merged builder + loader for UNet — auto-build engine if not present, with build parameters on the loader node. Maybe split off predetermined build approval or rejection config to a TensorRT Build Config node?
 - [ ] **WAN 2.2 Sampling** — DiT backbone (14B, 20-50 steps) is the high-impact target. Early-stage: ONNX export and scaffolding exist but engine building is blocked on host memory (~120 GB RAM needed) and no end-to-end run has completed.
 
+#### Done
+
+- [x] **LoRA Refit** — working for SDXL. ~13s refit vs ~5-10 min rebuild. See [REFIT.md](REFIT.md). ([#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1))
+
 #### Blocked
 
-- [ ] **LoRA Refit** — infrastructure complete, blocked on TRT MHA fusion absorbing attention weights ([#1](https://github.com/NubeBuster/ComfyUI_TensorRT/issues/1))
-- [ ] **Refit persistence** — serialize refitted engine to RAM or disk (moot until refit works)
+- [ ] **Refit persistence** — serialize refitted engine to RAM or disk (avoids re-refit after VRAM eviction)
 
 #### Shelved
 
