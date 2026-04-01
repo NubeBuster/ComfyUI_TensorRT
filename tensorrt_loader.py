@@ -10,6 +10,7 @@ import comfy.model_management
 import comfy.model_patcher
 import comfy.patcher_extension
 import comfy.supported_models
+import comfy.utils
 import folder_paths
 import logging
 
@@ -25,6 +26,12 @@ else:
         [os.path.join(folder_paths.models_dir, "tensorrt")],
         {".engine"},
     )
+
+# Register auto-managed engine directory
+_AUTO_ENGINE_DIR = os.path.join(folder_paths.models_dir, "tensorrt", "auto")
+os.makedirs(_AUTO_ENGINE_DIR, exist_ok=True)
+if "tensorrt" in folder_paths.folder_names_and_paths:
+    folder_paths.folder_names_and_paths["tensorrt"][0].append(_AUTO_ENGINE_DIR)
 
 import tensorrt as trt
 
@@ -399,7 +406,10 @@ class TensorRTRefitLoader:
         if not os.path.isfile(unet_path):
             raise FileNotFoundError(f"File {unet_path} does not exist")
 
+        pbar = comfy.utils.ProgressBar(4)
+
         # --- Step 1: Extract LoRA-patched weights from source model ---
+        pbar.update_absolute(0, 4)
         trt_logger.info("Refit: loading source model to extract weights...")
         comfy.model_management.load_models_gpu([source_model])
 
@@ -476,6 +486,7 @@ class TensorRTRefitLoader:
         comfy.model_management.soft_empty_cache()
 
         # --- Step 2: Deserialize the TRT engine ---
+        pbar.update_absolute(1, 4)
         trt_logger.info(f"Refit: deserializing engine: {unet_path}")
         torch.cuda.empty_cache()
         with open(unet_path, "rb") as f:
@@ -488,6 +499,7 @@ class TensorRTRefitLoader:
             )
 
         # --- Step 3: Refit weights ---
+        pbar.update_absolute(2, 4)
         trt_logger.info("Refit: applying weights to engine...")
         refitter = trt.Refitter(engine, logger)
 
@@ -597,9 +609,11 @@ class TensorRTRefitLoader:
         trt_logger.info("Refit: engine weights updated successfully")
 
         # --- Step 4: Create model patcher ---
+        pbar.update_absolute(3, 4)
         unet = TrTUnet.from_engine(engine)
         model = _create_model_for_type(model_type, unet)
         patcher = _wrap_trt_patcher(model, unet)
+        pbar.update_absolute(4, 4)
         return (patcher,)
 
 
@@ -616,11 +630,11 @@ _vae_engine_set_map = {}
 
 
 def _list_unet_engines():
-    """List TRT engine files, excluding VAE and refit engines."""
+    """List TRT engine files, excluding VAE engines. Includes refit-enabled engines."""
     return [
         f
         for f in folder_paths.get_filename_list("tensorrt")
-        if not _ENGINE_OP_RE.search(f) and not _REFIT_RE.search(f)
+        if not _ENGINE_OP_RE.search(f)
     ]
 
 

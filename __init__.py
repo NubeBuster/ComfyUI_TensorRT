@@ -1,3 +1,4 @@
+from .tensorrt_auto import TensorRTLoaderAuto
 from .tensorrt_convert import DYNAMIC_TRT_MODEL_CONVERSION
 from .tensorrt_convert import DYNAMIC_VAE_TRT_CONVERSION
 from .tensorrt_convert import STATIC_TRT_MODEL_CONVERSION
@@ -14,6 +15,7 @@ NODE_CLASS_MAPPINGS = {
     "TensorRTLoader": TensorRTLoader,
     "TensorRTRefitLoader": TensorRTRefitLoader,
     "TensorRTVAELoader": TensorRTVAELoader,
+    "TensorRTLoaderAuto": TensorRTLoaderAuto,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -24,6 +26,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TensorRTLoader": "TensorRT Loader",
     "TensorRTRefitLoader": "TensorRT Refit Loader",
     "TensorRTVAELoader": "TensorRT VAE Loader",
+    "TensorRTLoaderAuto": "TensorRT Loader Auto",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+WEB_DIRECTORY = "./web"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

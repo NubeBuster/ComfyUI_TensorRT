@@ -91,6 +91,327 @@ def build_onnx_weight_map(onnx_path):
     return weight_map
 
 
+def _make_profile_desc(
+    is_static,
+    batch_size_min,
+    batch_size_opt,
+    batch_size_max,
+    height_min,
+    height_opt,
+    height_max,
+    width_min,
+    width_opt,
+    width_max,
+    **kwargs,
+):
+    """Build the profile description string used in engine filenames.
+
+    Any extra keyword args (context_len, num_video_frames, etc.) are appended
+    alphabetically so new build parameters automatically differentiate profiles.
+    Default-like values (None, 0, 1) are omitted to keep existing names stable.
+    """
+    if is_static:
+        parts = [
+            "stat",
+            "b",
+            str(batch_size_opt),
+            "h",
+            str(height_opt),
+            "w",
+            str(width_opt),
+        ]
+    else:
+        parts = [
+            "dyn",
+            "b",
+            str(batch_size_min),
+            str(batch_size_max),
+            str(batch_size_opt),
+            "h",
+            str(height_min),
+            str(height_max),
+            str(height_opt),
+            "w",
+            str(width_min),
+            str(width_max),
+            str(width_opt),
+        ]
+    for key in sorted(kwargs):
+        val = kwargs[key]
+        if val is None or val == 0 or val == 1:
+            continue
+        parts.extend([key, str(val)])
+    return "-".join(parts)
+
+
+def build_unet_engine(
+    model,
+    output_engine_path,
+    batch_size_min,
+    batch_size_opt,
+    batch_size_max,
+    height_min,
+    height_opt,
+    height_max,
+    width_min,
+    width_opt,
+    width_max,
+    context_min,
+    context_opt,
+    context_max,
+    num_video_frames,
+    is_static,
+    enable_refit=True,
+    timing_cache_path=None,
+):
+    """Build a TRT UNet engine and write it to output_engine_path.
+
+    Handles model loading, ONNX export, TRT conversion, weight map sidecar,
+    and temp file cleanup. Returns the output engine path.
+    """
+    temp_dir = folder_paths.get_temp_directory()
+    output_onnx = os.path.normpath(
+        os.path.join(temp_dir, str(time.time()), "model.onnx")
+    )
+
+    comfy.model_management.unload_all_models()
+
+    # When refit is enabled, build from base weights only — LoRA patches are
+    # applied at load time via refit, not baked into the engine.
+    saved_patches = None
+    if enable_refit and model.patches:
+        saved_patches = model.patches
+        model.patches = {}
+
+    try:
+        force_patch = not isinstance(model, comfy.model_patcher.ModelPatcherDynamic)
+        comfy.model_management.load_models_gpu(
+            [model], force_patch_weights=force_patch, force_full_load=True
+        )
+    finally:
+        if saved_patches is not None:
+            model.patches = saved_patches
+
+    unet = model.model.diffusion_model
+    device = comfy.model_management.get_torch_device()
+    unet.to(device)
+
+    context_dim = model.model.model_config.unet_config.get("context_dim", None)
+    context_len = 77
+    context_len_min = context_len
+    y_dim = model.model.adm_channels
+    extra_input = {}
+    dtype = torch.float16
+
+    if isinstance(model.model, comfy.model_base.SD3):
+        context_embedder_config = model.model.model_config.unet_config.get(
+            "context_embedder_config", None
+        )
+        if context_embedder_config is not None:
+            context_dim = context_embedder_config.get("params", {}).get(
+                "in_features", None
+            )
+            context_len = 154
+    elif isinstance(model.model, comfy.model_base.AuraFlow):
+        context_dim = 2048
+        context_len_min = 256
+        context_len = 256
+    elif isinstance(model.model, comfy.model_base.Flux):
+        context_dim = model.model.model_config.unet_config.get("context_in_dim", None)
+        context_len_min = 256
+        context_len = 256
+        y_dim = model.model.model_config.unet_config.get("vec_in_dim", None)
+        extra_input = {"guidance": ()}
+        dtype = torch.bfloat16
+
+    if context_dim is None:
+        raise ValueError("Model not supported — no context_dim found in unet_config.")
+
+    input_names = ["x", "timesteps", "context"]
+    output_names = ["h"]
+
+    dynamic_axes = {
+        "x": {0: "batch", 2: "height", 3: "width"},
+        "timesteps": {0: "batch"},
+        "context": {0: "batch", 1: "num_embeds"},
+    }
+
+    transformer_options = model.model_options["transformer_options"].copy()
+    if model.model.model_config.unet_config.get("use_temporal_resblock", False):
+        batch_size_min = num_video_frames * batch_size_min
+        batch_size_opt = num_video_frames * batch_size_opt
+        batch_size_max = num_video_frames * batch_size_max
+
+        class UNET(torch.nn.Module):
+            def forward(self, x, timesteps, context, y):
+                return self.unet(
+                    x,
+                    timesteps,
+                    context,
+                    y,
+                    num_video_frames=self.num_video_frames,
+                    transformer_options=self.transformer_options,
+                )
+
+        svd_unet = UNET()
+        svd_unet.num_video_frames = num_video_frames
+        svd_unet.unet = unet
+        svd_unet.transformer_options = transformer_options
+        unet = svd_unet
+        context_len_min = context_len = 1
+    else:
+
+        class UNET(torch.nn.Module):
+            def forward(self, x, timesteps, context, *args):
+                extras = input_names[3:]
+                extra_args = {}
+                for i in range(len(extras)):
+                    extra_args[extras[i]] = args[i]
+                return self.unet(
+                    x,
+                    timesteps,
+                    context,
+                    transformer_options=self.transformer_options,
+                    **extra_args,
+                )
+
+        _unet = UNET()
+        _unet.unet = unet
+        _unet.transformer_options = transformer_options
+        unet = _unet
+
+    input_channels = model.model.model_config.unet_config.get("in_channels", 4)
+
+    inputs_shapes_min = (
+        (batch_size_min, input_channels, height_min // 8, width_min // 8),
+        (batch_size_min,),
+        (batch_size_min, context_len_min * context_min, context_dim),
+    )
+    inputs_shapes_opt = (
+        (batch_size_opt, input_channels, height_opt // 8, width_opt // 8),
+        (batch_size_opt,),
+        (batch_size_opt, context_len * context_opt, context_dim),
+    )
+    inputs_shapes_max = (
+        (batch_size_max, input_channels, height_max // 8, width_max // 8),
+        (batch_size_max,),
+        (batch_size_max, context_len * context_max, context_dim),
+    )
+
+    if y_dim > 0:
+        input_names.append("y")
+        dynamic_axes["y"] = {0: "batch"}
+        inputs_shapes_min += ((batch_size_min, y_dim),)
+        inputs_shapes_opt += ((batch_size_opt, y_dim),)
+        inputs_shapes_max += ((batch_size_max, y_dim),)
+
+    for k in extra_input:
+        input_names.append(k)
+        dynamic_axes[k] = {0: "batch"}
+        inputs_shapes_min += ((batch_size_min,) + extra_input[k],)
+        inputs_shapes_opt += ((batch_size_opt,) + extra_input[k],)
+        inputs_shapes_max += ((batch_size_max,) + extra_input[k],)
+
+    inputs = ()
+    for shape in inputs_shapes_opt:
+        inputs += (torch.zeros(shape, device=device, dtype=dtype),)
+
+    os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
+    with _disable_comfy_cast(unet):
+        torch.onnx.export(
+            unet,
+            inputs,
+            output_onnx,
+            verbose=False,
+            input_names=input_names,
+            output_names=output_names,
+            opset_version=17,
+            dynamic_axes=dynamic_axes,
+            dynamo=False,
+        )
+
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+
+    # TRT conversion
+    trt_logger = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(trt_logger)
+
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    )
+    parser = trt.OnnxParser(network, trt_logger)
+    success = parser.parse_from_file(output_onnx)
+    for idx in range(parser.num_errors):
+        log.error("ONNX parse error: %s", parser.get_error(idx))
+
+    if not success:
+        raise RuntimeError("Failed to parse ONNX model for TRT conversion.")
+
+    config = builder.create_builder_config()
+    profile = builder.create_optimization_profile()
+
+    # Timing cache
+    if timing_cache_path:
+        buffer = b""
+        if os.path.exists(timing_cache_path):
+            with open(timing_cache_path, "rb") as f:
+                buffer = f.read()
+            log.info("Read %d bytes from timing cache.", len(buffer))
+        timing_cache = config.create_timing_cache(buffer)
+        config.set_timing_cache(timing_cache, ignore_mismatch=True)
+
+    config.progress_monitor = TQDMProgressMonitor()
+
+    for k in range(len(input_names)):
+        profile.set_shape(
+            input_names[k],
+            inputs_shapes_min[k],
+            inputs_shapes_opt[k],
+            inputs_shapes_max[k],
+        )
+
+    if dtype == torch.float16:
+        config.set_flag(trt.BuilderFlag.FP16)
+    if dtype == torch.bfloat16:
+        config.set_flag(trt.BuilderFlag.BF16)
+    if enable_refit:
+        config.set_flag(trt.BuilderFlag.REFIT)
+
+    config.add_optimization_profile(profile)
+
+    serialized_engine = builder.build_serialized_network(network, config)
+    if serialized_engine is None:
+        raise RuntimeError("TensorRT engine build failed — serialized_engine is None.")
+
+    os.makedirs(os.path.dirname(output_engine_path), exist_ok=True)
+    with open(output_engine_path, "wb") as f:
+        f.write(serialized_engine)
+    log.info("Wrote TRT engine: %s", output_engine_path)
+
+    # Save ONNX weight name mapping for refit (before ONNX cleanup)
+    if enable_refit:
+        weight_map = build_onnx_weight_map(output_onnx)
+        map_path = output_engine_path.replace(".engine", ".weight_map.json")
+        with open(map_path, "w") as f:
+            json.dump(weight_map, f)
+        log.info("Saved refit weight map: %s (%d entries)", map_path, len(weight_map))
+
+    # Save timing cache
+    if timing_cache_path:
+        tc = config.get_timing_cache()
+        with open(timing_cache_path, "wb") as f:
+            f.write(memoryview(tc.serialize()))
+
+    # Clean up temp ONNX directory
+    try:
+        shutil.rmtree(os.path.dirname(output_onnx))
+    except OSError:
+        pass
+
+    return output_engine_path
+
+
 class TQDMProgressMonitor(trt.IProgressMonitor):
     def __init__(self):
         trt.IProgressMonitor.__init__(self)
@@ -290,296 +611,61 @@ class TRT_MODEL_CONVERSION_BASE:
         context_max,
         num_video_frames,
         is_static: bool,
-        enable_refit: bool = False,
+        enable_refit: bool = True,
         prompt=None,
         unique_id=None,
     ):
         filename_prefix = _resolve_filename_prefix(
             filename_prefix, "unet", prompt, unique_id, input_name="model"
         )
-        output_onnx = os.path.normpath(
-            os.path.join(
-                os.path.join(self.temp_dir, "{}".format(time.time())), "model.onnx"
-            )
-        )
-
-        comfy.model_management.unload_all_models()
-        force_patch = not isinstance(model, comfy.model_patcher.ModelPatcherDynamic)
-        comfy.model_management.load_models_gpu(
-            [model], force_patch_weights=force_patch, force_full_load=True
-        )
-        unet = model.model.diffusion_model
-        # Ensure all weights are on GPU for ONNX tracing (Dynamic patcher
-        # may leave weights on CPU when force_patch_weights is False)
-        device = comfy.model_management.get_torch_device()
-        unet.to(device)
-
-        context_dim = model.model.model_config.unet_config.get("context_dim", None)
-        context_len = 77
-        context_len_min = context_len
-        y_dim = model.model.adm_channels
-        extra_input = {}
-        dtype = torch.float16
-
-        if isinstance(model.model, comfy.model_base.SD3):  # SD3
-            context_embedder_config = model.model.model_config.unet_config.get(
-                "context_embedder_config", None
-            )
-            if context_embedder_config is not None:
-                context_dim = context_embedder_config.get("params", {}).get(
-                    "in_features", None
-                )
-                context_len = 154  # NOTE: SD3 can have 77 or 154 depending on which text encoders are used, this is why context_len_min stays 77
-        elif isinstance(model.model, comfy.model_base.AuraFlow):
-            context_dim = 2048
-            context_len_min = 256
-            context_len = 256
-        elif isinstance(model.model, comfy.model_base.Flux):
-            context_dim = model.model.model_config.unet_config.get(
-                "context_in_dim", None
-            )
-            context_len_min = 256
-            context_len = 256
-            y_dim = model.model.model_config.unet_config.get("vec_in_dim", None)
-            extra_input = {"guidance": ()}
-            dtype = torch.bfloat16
-
-        if context_dim is not None:
-            input_names = ["x", "timesteps", "context"]
-            output_names = ["h"]
-
-            dynamic_axes = {
-                "x": {0: "batch", 2: "height", 3: "width"},
-                "timesteps": {0: "batch"},
-                "context": {0: "batch", 1: "num_embeds"},
-            }
-
-            transformer_options = model.model_options["transformer_options"].copy()
-            if model.model.model_config.unet_config.get(
-                "use_temporal_resblock", False
-            ):  # SVD
-                batch_size_min = num_video_frames * batch_size_min
-                batch_size_opt = num_video_frames * batch_size_opt
-                batch_size_max = num_video_frames * batch_size_max
-
-                class UNET(torch.nn.Module):
-                    def forward(self, x, timesteps, context, y):
-                        return self.unet(
-                            x,
-                            timesteps,
-                            context,
-                            y,
-                            num_video_frames=self.num_video_frames,
-                            transformer_options=self.transformer_options,
-                        )
-
-                svd_unet = UNET()
-                svd_unet.num_video_frames = num_video_frames
-                svd_unet.unet = unet
-                svd_unet.transformer_options = transformer_options
-                unet = svd_unet
-                context_len_min = context_len = 1
-            else:
-
-                class UNET(torch.nn.Module):
-                    def forward(self, x, timesteps, context, *args):
-                        extras = input_names[3:]
-                        extra_args = {}
-                        for i in range(len(extras)):
-                            extra_args[extras[i]] = args[i]
-                        return self.unet(
-                            x,
-                            timesteps,
-                            context,
-                            transformer_options=self.transformer_options,
-                            **extra_args,
-                        )
-
-                _unet = UNET()
-                _unet.unet = unet
-                _unet.transformer_options = transformer_options
-                unet = _unet
-
-            input_channels = model.model.model_config.unet_config.get("in_channels", 4)
-
-            inputs_shapes_min = (
-                (batch_size_min, input_channels, height_min // 8, width_min // 8),
-                (batch_size_min,),
-                (batch_size_min, context_len_min * context_min, context_dim),
-            )
-            inputs_shapes_opt = (
-                (batch_size_opt, input_channels, height_opt // 8, width_opt // 8),
-                (batch_size_opt,),
-                (batch_size_opt, context_len * context_opt, context_dim),
-            )
-            inputs_shapes_max = (
-                (batch_size_max, input_channels, height_max // 8, width_max // 8),
-                (batch_size_max,),
-                (batch_size_max, context_len * context_max, context_dim),
-            )
-
-            if y_dim > 0:
-                input_names.append("y")
-                dynamic_axes["y"] = {0: "batch"}
-                inputs_shapes_min += ((batch_size_min, y_dim),)
-                inputs_shapes_opt += ((batch_size_opt, y_dim),)
-                inputs_shapes_max += ((batch_size_max, y_dim),)
-
-            for k in extra_input:
-                input_names.append(k)
-                dynamic_axes[k] = {0: "batch"}
-                inputs_shapes_min += ((batch_size_min,) + extra_input[k],)
-                inputs_shapes_opt += ((batch_size_opt,) + extra_input[k],)
-                inputs_shapes_max += ((batch_size_max,) + extra_input[k],)
-
-            inputs = ()
-            for shape in inputs_shapes_opt:
-                inputs += (
-                    torch.zeros(
-                        shape,
-                        device=comfy.model_management.get_torch_device(),
-                        dtype=dtype,
-                    ),
-                )
-
-        else:
-            log.error("Model not supported.")
-            return ()
-
-        os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
-        with _disable_comfy_cast(unet):
-            torch.onnx.export(
-                unet,
-                inputs,
-                output_onnx,
-                verbose=False,
-                input_names=input_names,
-                output_names=output_names,
-                opset_version=17,
-                dynamic_axes=dynamic_axes,
-                dynamo=False,
-            )
-
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
-
-        # TRT conversion starts here
-        logger = trt.Logger(trt.Logger.INFO)
-        builder = trt.Builder(logger)
-
-        network = builder.create_network(
-            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        )
-        parser = trt.OnnxParser(network, logger)
-        success = parser.parse_from_file(output_onnx)
-        for idx in range(parser.num_errors):
-            log.error("ONNX parse error: %s", parser.get_error(idx))
-
-        if not success:
-            log.error("ONNX load failed")
-            return ()
-
-        config = builder.create_builder_config()
-        profile = builder.create_optimization_profile()
-        self._setup_timing_cache(config)
-        config.progress_monitor = TQDMProgressMonitor()
-
-        prefix_encode = ""
-        for k in range(len(input_names)):
-            min_shape = inputs_shapes_min[k]
-            opt_shape = inputs_shapes_opt[k]
-            max_shape = inputs_shapes_max[k]
-            profile.set_shape(input_names[k], min_shape, opt_shape, max_shape)
-
-            # Encode shapes to filename
-            encode = lambda a: ".".join(map(lambda x: str(x), a))
-            prefix_encode += "{}#{}#{}#{};".format(
-                input_names[k], encode(min_shape), encode(opt_shape), encode(max_shape)
-            )
-
-        if dtype == torch.float16:
-            config.set_flag(trt.BuilderFlag.FP16)
-        if dtype == torch.bfloat16:
-            config.set_flag(trt.BuilderFlag.BF16)
-        if enable_refit:
-            config.set_flag(trt.BuilderFlag.REFIT)
-
-        config.add_optimization_profile(profile)
 
         refit_tag = "_refit" if enable_refit else ""
-        if is_static:
-            filename_prefix = "{}{}_${}".format(
-                filename_prefix,
-                refit_tag,
-                "-".join(
-                    (
-                        "stat",
-                        "b",
-                        str(batch_size_opt),
-                        "h",
-                        str(height_opt),
-                        "w",
-                        str(width_opt),
-                    )
-                ),
-            )
-        else:
-            filename_prefix = "{}{}_${}".format(
-                filename_prefix,
-                refit_tag,
-                "-".join(
-                    (
-                        "dyn",
-                        "b",
-                        str(batch_size_min),
-                        str(batch_size_max),
-                        str(batch_size_opt),
-                        "h",
-                        str(height_min),
-                        str(height_max),
-                        str(height_opt),
-                        "w",
-                        str(width_min),
-                        str(width_max),
-                        str(width_opt),
-                    )
-                ),
-            )
+        profile_desc = _make_profile_desc(
+            is_static,
+            batch_size_min,
+            batch_size_opt,
+            batch_size_max,
+            height_min,
+            height_opt,
+            height_max,
+            width_min,
+            width_opt,
+            width_max,
+        )
+        filename_prefix = f"{filename_prefix}{refit_tag}_${profile_desc}"
 
         os.makedirs(
             os.path.join(self.output_dir, os.path.dirname(filename_prefix)),
             exist_ok=True,
         )
-        serialized_engine = builder.build_serialized_network(network, config)
 
         full_output_folder, filename, counter, subfolder, filename_prefix = (
             folder_paths.get_save_image_path(filename_prefix, self.output_dir)
         )
-        output_trt_engine = os.path.join(
+        output_engine_path = os.path.join(
             full_output_folder, f"{filename}_{counter:05}_.engine"
         )
 
-        with open(output_trt_engine, "wb") as f:
-            f.write(serialized_engine)
-
-        # Save ONNX weight name mapping for refit (before ONNX cleanup)
-        if enable_refit:
-            weight_map = build_onnx_weight_map(output_onnx)
-            map_path = output_trt_engine.replace(".engine", ".weight_map.json")
-            with open(map_path, "w") as f:
-                json.dump(weight_map, f)
-            log.info(
-                "Saved refit weight map: %s (%d entries)", map_path, len(weight_map)
-            )
-
-        self._save_timing_cache(config)
-
-        # Clean up temp ONNX directory (includes external data files)
-        onnx_dir = os.path.dirname(output_onnx)
-        try:
-            shutil.rmtree(onnx_dir)
-        except OSError:
-            pass
+        build_unet_engine(
+            model,
+            output_engine_path,
+            batch_size_min,
+            batch_size_opt,
+            batch_size_max,
+            height_min,
+            height_opt,
+            height_max,
+            width_min,
+            width_opt,
+            width_max,
+            context_min,
+            context_opt,
+            context_max,
+            num_video_frames,
+            is_static,
+            enable_refit=enable_refit,
+            timing_cache_path=self.timing_cache_path,
+        )
 
         return ()
 
@@ -746,8 +832,12 @@ class DYNAMIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                 "enable_refit": (
                     "BOOLEAN",
                     {
-                        "default": False,
-                        "tooltip": "Allow weight updates after building (for LoRA swapping). Slightly larger engine file.",
+                        "default": True,
+                        "tooltip": "Build with REFIT flag for LoRA swapping via Refit Loader or TensorRT Loader Auto. "
+                        "Negligible overhead (~5% larger file, single-digit % slower inference). "
+                        "When enabled, LoRA patches are stripped during build — the engine contains base weights only. "
+                        "When disabled, all applied weights (including LoRAs) are baked in permanently. "
+                        "Recommended to leave enabled.",
                     },
                 ),
             },
@@ -881,8 +971,12 @@ class STATIC_TRT_MODEL_CONVERSION(TRT_MODEL_CONVERSION_BASE):
                 "enable_refit": (
                     "BOOLEAN",
                     {
-                        "default": False,
-                        "tooltip": "Allow weight updates after building (for LoRA swapping). Slightly larger engine file.",
+                        "default": True,
+                        "tooltip": "Build with REFIT flag for LoRA swapping via Refit Loader or TensorRT Loader Auto. "
+                        "Negligible overhead (~5% larger file, single-digit % slower inference). "
+                        "When enabled, LoRA patches are stripped during build — the engine contains base weights only. "
+                        "When disabled, all applied weights (including LoRAs) are baked in permanently. "
+                        "Recommended to leave enabled.",
                     },
                 ),
             },
