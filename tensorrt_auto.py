@@ -203,34 +203,39 @@ def _list_real_engines(auto_dir):
 
 
 def _evict_engine(path, size):
-    """Remove an engine file and its sidecars."""
+    """Remove an engine file and its sidecars. Returns (filename, size_bytes)."""
     log.info("Auto: FIFO evicting %s (%.1f MB)", path, size / (1024 * 1024))
     os.remove(path)
     for suffix in (".weight_map.json", ".meta.json"):
         sidecar = path.replace(".engine", suffix)
         if os.path.isfile(sidecar) and not os.path.islink(sidecar):
             os.remove(sidecar)
+    return (os.path.basename(path), size)
 
 
 def _fifo_evict_max_usage(auto_dir, max_bytes, estimated_new_bytes=0):
-    """Evict oldest real engines until auto/ dir is under max_bytes."""
+    """Evict oldest real engines until auto/ dir is under max_bytes. Returns list of (filename, size_bytes)."""
     entries, total_real = _list_real_engines(auto_dir)
+    evicted = []
     for _mtime, path, size in entries:
         if total_real + estimated_new_bytes <= max_bytes:
             break
-        _evict_engine(path, size)
+        evicted.append(_evict_engine(path, size))
         total_real -= size
+    return evicted
 
 
 def _fifo_evict_min_free(auto_dir, min_free_bytes, estimated_new_bytes=0):
-    """Evict oldest real engines until drive has min_free_bytes free."""
+    """Evict oldest real engines until drive has min_free_bytes free. Returns list of (filename, size_bytes)."""
     entries, _ = _list_real_engines(auto_dir)
+    evicted = []
     for _mtime, path, size in entries:
         stat = os.statvfs(auto_dir)
         free = stat.f_bavail * stat.f_frsize
         if free - estimated_new_bytes >= min_free_bytes:
             break
-        _evict_engine(path, size)
+        evicted.append(_evict_engine(path, size))
+    return evicted
 
 
 def _do_refit(engine, unet_path, source_model, model_type):
@@ -663,17 +668,28 @@ class TensorRTLoaderAuto:
             log.info("Auto: building engine — this takes 5-10 minutes for SDXL...")
             _send_trt_progress("building")
 
+            evicted = []
             if disk_management == "max_disk_usage":
-                _fifo_evict_max_usage(
+                evicted = _fifo_evict_max_usage(
                     auto_dir,
                     int(threshold_gb * 1024**3),
                     estimated_new_bytes=2 * 1024**3,
                 )
             elif disk_management == "min_disk_free":
-                _fifo_evict_min_free(
+                evicted = _fifo_evict_min_free(
                     auto_dir,
                     int(threshold_gb * 1024**3),
                     estimated_new_bytes=2 * 1024**3,
+                )
+            if evicted:
+                PromptServer.instance.send_sync(
+                    "trt_disk_eviction",
+                    {
+                        "evicted": [
+                            {"filename": fn, "size_bytes": sz} for fn, sz in evicted
+                        ],
+                        "total_freed_bytes": sum(sz for _, sz in evicted),
+                    },
                 )
 
             if static_shapes == "static":

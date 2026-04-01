@@ -232,10 +232,185 @@ const PHASES = {
     cached:     { text: "Engine cached \u2014 skipped",             pct: 100 },
 };
 
+// --- Disk eviction toast (persistent, separate from progress toast) ---
+
+const EVICTION_TOAST_CLASS = "trt-eviction-toast";
+const EVICTION_POS_KEY = "trt_eviction_toast_pos";
+
+let activeEvictionToast = null;
+
+function injectEvictionStyles() {
+    if (document.getElementById("trt-eviction-toast-css")) return;
+    const style = document.createElement("style");
+    style.id = "trt-eviction-toast-css";
+    style.textContent = `
+        .${EVICTION_TOAST_CLASS} {
+            position: fixed;
+            z-index: 99999;
+            background: #1e1e1e;
+            border: 1px solid #c0a000;
+            border-radius: 8px;
+            padding: 12px 16px;
+            min-width: 260px;
+            max-width: 380px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+            font-family: system-ui, -apple-system, sans-serif;
+            color: #ddd;
+            transition: opacity 0.3s ease;
+        }
+        .${EVICTION_TOAST_CLASS}.hiding { opacity: 0; }
+        .${EVICTION_TOAST_CLASS} .ev-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            cursor: grab;
+            user-select: none;
+        }
+        .${EVICTION_TOAST_CLASS} .ev-header.dragging { cursor: grabbing; }
+        .${EVICTION_TOAST_CLASS} .ev-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #c0a000;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .${EVICTION_TOAST_CLASS} .ev-close {
+            background: none;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 0 2px;
+            line-height: 1;
+        }
+        .${EVICTION_TOAST_CLASS} .ev-close:hover { color: #ddd; }
+        .${EVICTION_TOAST_CLASS} .ev-body {
+            font-size: 12px;
+            color: #bbb;
+        }
+        .${EVICTION_TOAST_CLASS} .ev-file {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 2px 0;
+            border-bottom: 1px solid #2a2a2a;
+            word-break: break-all;
+        }
+        .${EVICTION_TOAST_CLASS} .ev-file:last-child { border-bottom: none; }
+        .${EVICTION_TOAST_CLASS} .ev-size { white-space: nowrap; color: #888; }
+        .${EVICTION_TOAST_CLASS} .ev-total {
+            margin-top: 8px;
+            font-size: 11px;
+            color: #888;
+            text-align: right;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+function loadEvictionPos() {
+    try {
+        const raw = localStorage.getItem(EVICTION_POS_KEY);
+        if (!raw) return null;
+        const pos = JSON.parse(raw);
+        if (typeof pos.bottom !== "number" || typeof pos.right !== "number") return null;
+        return pos;
+    } catch { return null; }
+}
+
+function saveEvictionPos(bottom, right) {
+    try { localStorage.setItem(EVICTION_POS_KEY, JSON.stringify({ bottom, right })); } catch { /**/ }
+}
+
+function positionEvictionToast(el) {
+    const pos = loadEvictionPos() || { bottom: 20, right: 20 };
+    el.style.bottom = `${pos.bottom}px`;
+    el.style.right = `${pos.right}px`;
+    el.style.top = "auto";
+    el.style.left = "auto";
+}
+
+function setupEvictionDrag(toast) {
+    const header = toast.querySelector(".ev-header");
+    let dragging = false, startX, startY, startBottom, startRight;
+    header.addEventListener("mousedown", (e) => {
+        if (e.target.closest(".ev-close")) return;
+        dragging = true;
+        const rect = toast.getBoundingClientRect();
+        startX = e.clientX; startY = e.clientY;
+        startBottom = window.innerHeight - rect.bottom;
+        startRight = window.innerWidth - rect.right;
+        header.classList.add("dragging");
+        e.preventDefault();
+    });
+    document.addEventListener("mousemove", (e) => {
+        if (!dragging) return;
+        toast.style.bottom = `${startBottom - (e.clientY - startY)}px`;
+        toast.style.right = `${startRight - (e.clientX - startX)}px`;
+        toast.style.top = "auto"; toast.style.left = "auto";
+    });
+    document.addEventListener("mouseup", () => {
+        if (!dragging) return;
+        dragging = false;
+        header.classList.remove("dragging");
+        const rect = toast.getBoundingClientRect();
+        saveEvictionPos(window.innerHeight - rect.bottom, window.innerWidth - rect.right);
+    });
+}
+
+function dismissEviction() {
+    if (!activeEvictionToast) return;
+    activeEvictionToast.classList.add("hiding");
+    const el = activeEvictionToast;
+    setTimeout(() => { el.remove(); if (activeEvictionToast === el) activeEvictionToast = null; }, 300);
+}
+
+function formatBytes(bytes) {
+    if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+    if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
+    return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+function showEvictionToast(evicted, totalFreedBytes) {
+    injectEvictionStyles();
+    if (activeEvictionToast) activeEvictionToast.remove();
+
+    const el = document.createElement("div");
+    el.className = EVICTION_TOAST_CLASS;
+
+    const fileRows = evicted.map(({ filename, size_bytes }) => `
+        <div class="ev-file">
+            <span>${filename}</span>
+            <span class="ev-size">${formatBytes(size_bytes)}</span>
+        </div>
+    `).join("");
+
+    el.innerHTML = `
+        <div class="ev-header">
+            <span class="ev-title">TensorRT \u2014 Disk Cleanup</span>
+            <button class="ev-close" title="Dismiss">\u00d7</button>
+        </div>
+        <div class="ev-body">${fileRows}</div>
+        <div class="ev-total">Freed ${formatBytes(totalFreedBytes)} total</div>
+    `;
+    el.querySelector(".ev-close").addEventListener("click", dismissEviction);
+    document.body.appendChild(el);
+    setupEvictionDrag(el);
+    positionEvictionToast(el);
+    activeEvictionToast = el;
+}
+
+// --- Progress toast ---
+
 app.registerExtension({
     name: "ComfyUI.TensorRT.AutoLoaderToast",
 
     async setup() {
+        api.addEventListener("trt_disk_eviction", ({ detail }) => {
+            showEvictionToast(detail.evicted, detail.total_freed_bytes);
+        });
+
         api.addEventListener("trt_auto_progress", ({ detail }) => {
             const { phase } = detail;
             const info = PHASES[phase];
