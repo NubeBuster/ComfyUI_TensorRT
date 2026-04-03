@@ -16,6 +16,27 @@ import logging
 
 trt_logger = logging.getLogger("comfyui_tensorrt")
 
+
+def _vram_snapshot(label=""):
+    """Log current VRAM usage for debugging model lifecycle."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        alloc = torch.cuda.memory_allocated() / (1024 * 1024)
+        reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+        free, total = torch.cuda.mem_get_info()
+        free_mb = free / (1024 * 1024)
+        total_mb = total / (1024 * 1024)
+        trt_logger.info(
+            f"[VRAM {label}] allocated={alloc:.0f} MB, reserved={reserved:.0f} MB, "
+            f"free={free_mb:.0f}/{total_mb:.0f} MB"
+        )
+    except Exception as e:
+        trt_logger.debug(f"[VRAM {label}] snapshot failed: {e}")
+
+
 if "tensorrt" in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["tensorrt"][0].append(
         os.path.join(folder_paths.models_dir, "tensorrt")
@@ -68,19 +89,31 @@ class TrTEngine:
         self.engine_path = engine_path
         self.engine = None
         self.context = None
+        self._label = label
 
         # Probe engine to get memory sizes, then free it immediately.
         # device_memory_size = execution context scratch memory (small)
         # engine file size ≈ GPU weight memory (large, loaded 1:1 to VRAM)
         # We report both so ComfyUI knows the true VRAM cost.
+        _vram_snapshot(f"{label} pre-probe")
         with open(engine_path, "rb") as f:
             data = f.read()
             engine = runtime.deserialize_cuda_engine(data)
+        if engine is None:
+            _vram_snapshot(f"{label} probe FAILED (deserialize returned None)")
+            raise RuntimeError(
+                f"TRT engine probe failed — deserialize returned None for: "
+                f"{engine_path}\n"
+                f"File size: {len(data) / (1024 * 1024):.0f} MB. "
+                f"Likely CUDA OOM during deserialization. "
+                f"Check [VRAM] log lines above for memory state."
+            )
         self.context_memory_size = engine.device_memory_size
         self.engine_weight_size = len(data)
         self.total_vram_size = self.engine_weight_size + self.context_memory_size
         del engine, data
         comfy.model_management.soft_empty_cache()
+        _vram_snapshot(f"{label} post-probe")
         trt_logger.info(
             f"{label} probed: {engine_path} "
             f"(weights: {self.engine_weight_size / (1024 * 1024):.0f} MB, "
@@ -90,37 +123,55 @@ class TrTEngine:
     def _load(self):
         """Deserialize engine and create execution context."""
         if self.engine is not None:
+            trt_logger.debug(
+                f"[lifecycle] {self._label} _load() skipped — engine already loaded "
+                f"(path={self.engine_path})"
+            )
             return
         if self.engine_path is None:
             raise RuntimeError(
                 "Cannot reload a refitted TRT engine — it exists only in memory. "
                 "Re-run the refit node to recreate it."
             )
-        trt_logger.info(f"TRT loading engine: {self.engine_path}")
+        _vram_snapshot(f"{self._label} pre-load")
+        trt_logger.info(f"[lifecycle] {self._label} loading engine: {self.engine_path}")
         with open(self.engine_path, "rb") as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         if self.engine is None:
+            _vram_snapshot(f"{self._label} load FAILED")
             raise RuntimeError(
                 f"Failed to deserialize TensorRT engine: {self.engine_path}\n"
                 "The engine file may be corrupt or built with an incompatible "
                 "TensorRT version. Try rebuilding the engine."
             )
         self.context = self.engine.create_execution_context()
+        _vram_snapshot(f"{self._label} post-load")
 
     def _unload(self):
         """Release engine and execution context VRAM."""
         if self.engine is None:
+            trt_logger.debug(
+                f"[lifecycle] {self._label} _unload() skipped — already unloaded"
+            )
             return
-        trt_logger.info("TRT unloading engine")
+        _vram_snapshot(f"{self._label} pre-unload")
+        trt_logger.info(
+            f"[lifecycle] {self._label} unloading engine (path={self.engine_path})"
+        )
         del self.context
         del self.engine
         self.context = None
         self.engine = None
+        import torch
+
+        torch.cuda.empty_cache()
+        _vram_snapshot(f"{self._label} post-unload")
 
     @classmethod
     def from_engine(cls, engine):
         """Create from an already-deserialized engine (e.g. after refit)."""
         obj = cls.__new__(cls)
+        obj._label = "TRT"
         obj.engine_path = None
         obj.engine = engine
         obj.context = engine.create_execution_context()
@@ -369,15 +420,28 @@ def _wrap_trt_patcher(model, unet):
     )
 
     def _on_load(p, _device_to, _lowvram, _force_patch, _full_load):
+        engine_loaded = p.model.diffusion_model.engine is not None
+        trt_logger.info(
+            f"[lifecycle] UNet ON_LOAD called (engine_already_loaded={engine_loaded}, "
+            f"path={p.model.diffusion_model.engine_path})"
+        )
+        _vram_snapshot("UNet ON_LOAD pre")
         torch.cuda.empty_cache()
         p.model.diffusion_model._load()
         p.model.model_loaded_weight_memory = trt_memory
+        _vram_snapshot("UNet ON_LOAD post")
 
     def _on_detach(p, _unpatch_all):
         # Keep engine hot — avoid reload thrash during XY plots.
         # TRT engines can't be partially unloaded like PyTorch models;
         # unload+reload cycles cost ~4s each for deserialization.
-        pass
+        engine_loaded = p.model.diffusion_model.engine is not None
+        trt_logger.info(
+            f"[lifecycle] UNet ON_DETACH called — keeping engine hot "
+            f"(engine_loaded={engine_loaded}, "
+            f"path={p.model.diffusion_model.engine_path})"
+        )
+        _vram_snapshot("UNet ON_DETACH")
 
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach)
@@ -854,16 +918,30 @@ class TrtVAE:
         encode_eng = self.encode_eng
 
         def _on_load(p, _device_to, _lowvram, _force_patch, _full_load):
+            dec_loaded = decode_eng.engine is not None if decode_eng else None
+            enc_loaded = encode_eng.engine is not None if encode_eng else None
+            trt_logger.info(
+                f"[lifecycle] VAE ON_LOAD called "
+                f"(decode_loaded={dec_loaded}, encode_loaded={enc_loaded})"
+            )
+            _vram_snapshot("VAE ON_LOAD pre")
             torch.cuda.empty_cache()
             if decode_eng:
                 decode_eng._load()
             if encode_eng:
                 encode_eng._load()
             p.model.model_loaded_weight_memory = trt_mem
+            _vram_snapshot("VAE ON_LOAD post")
 
         def _on_detach(p, _unpatch_all):
             # Keep engines hot — avoid reload thrash during XY plots
-            pass
+            dec_loaded = decode_eng.engine is not None if decode_eng else None
+            enc_loaded = encode_eng.engine is not None if encode_eng else None
+            trt_logger.info(
+                f"[lifecycle] VAE ON_DETACH called — keeping engines hot "
+                f"(decode_loaded={dec_loaded}, encode_loaded={enc_loaded})"
+            )
+            _vram_snapshot("VAE ON_DETACH")
 
         self.patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
         self.patcher.add_callback(

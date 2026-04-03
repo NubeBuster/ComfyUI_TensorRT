@@ -895,6 +895,20 @@ class TensorRTLoaderAuto:
         has_patches = refit and hasattr(model, "patches") and len(model.patches) > 0
         current_uuid = getattr(model, "patches_uuid", None) if has_patches else None
 
+        log.info(
+            f"Auto: cache check — has_patches={has_patches}, "
+            f"current_uuid={current_uuid}, engine_path={engine_path}"
+        )
+        log.info(
+            f"Auto: refit_cache state — uuid={_refit_cache['patches_uuid']}, "
+            f"path={_refit_cache['engine_path']}, "
+            f"patcher={'set' if _refit_cache['patcher'] else 'None'}"
+        )
+        log.info(
+            f"Auto: engine_cache state — path={_engine_cache['engine_path']}, "
+            f"patcher={'set' if _engine_cache['patcher'] else 'None'}"
+        )
+
         if (
             has_patches
             and current_uuid is not None
@@ -921,6 +935,24 @@ class TensorRTLoaderAuto:
                 "Auto: refit cache invalid (persisted engine missing), will re-refit"
             )
             _refit_cache["patcher"] = None
+        elif has_patches:
+            # Log why refit cache missed
+            reasons = []
+            if current_uuid is None:
+                reasons.append("current_uuid is None")
+            if _refit_cache["patches_uuid"] != current_uuid:
+                reasons.append(
+                    f"uuid mismatch (cached={_refit_cache['patches_uuid']} "
+                    f"vs current={current_uuid})"
+                )
+            if _refit_cache["engine_path"] != engine_path:
+                reasons.append(
+                    f"path mismatch (cached={_refit_cache['engine_path']} "
+                    f"vs current={engine_path})"
+                )
+            if _refit_cache["patcher"] is None:
+                reasons.append("cached patcher is None")
+            log.info(f"Auto: refit cache MISS — {'; '.join(reasons)}")
 
         if (
             not has_patches
@@ -939,12 +971,31 @@ class TensorRTLoaderAuto:
         pbar.update_absolute(2, 4)
         _send_trt_progress("loading")
         import torch
+        from .tensorrt_loader import _vram_snapshot
+
+        # Explicitly release old TRT engines held by our caches.
+        # TRT allocates VRAM outside PyTorch, so unload_all_models() and
+        # torch.cuda.empty_cache() can't free it — we must call _unload().
+        _vram_snapshot("Auto pre-release-old-engines")
+        for cache_name, cache in [("refit", _refit_cache), ("engine", _engine_cache)]:
+            if cache.get("patcher") is not None:
+                old_unet = cache["patcher"].model.diffusion_model
+                log.info(
+                    f"Auto: releasing old {cache_name} cache engine "
+                    f"(loaded={old_unet.engine is not None}, "
+                    f"path={old_unet.engine_path})"
+                )
+                old_unet._unload()
+                cache["patcher"] = None
 
         # Free VRAM before probe — TrTUnet.__init__ deserializes the engine
         # to read device_memory_size, which needs the full engine in GPU memory.
+        _vram_snapshot("Auto pre-unload_all_models")
         comfy.model_management.unload_all_models()
+        _vram_snapshot("Auto post-unload_all_models")
         comfy.model_management.soft_empty_cache()
         torch.cuda.empty_cache()
+        _vram_snapshot("Auto post-empty_cache (about to probe)")
         unet = TrTUnet(engine_path)
         model_shell = _create_model_for_type(model_type, unet)
         patcher = _wrap_trt_patcher(model_shell, unet)
