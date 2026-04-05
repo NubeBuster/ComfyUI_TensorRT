@@ -1393,6 +1393,10 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         "specifically for the opt (optimal) dimensions — best performance occurs "
         "at opt, with gradual degradation toward the extremes.\n\n"
         "Dynamic engines use more VRAM than static; the wider the range, the more VRAM consumed.\n\n"
+        "NOTE: TRT VAE provides only marginal speedup (~1.2x) over the standard PyTorch VAE at "
+        "typical resolutions, while consuming significantly more VRAM (~3 GB vs ~160 MB for decode). "
+        "The benefit grows at higher resolutions where decode time becomes non-trivial. "
+        "For most workflows where UNet sampling dominates, TRT VAE has negligible impact on total time.\n\n"
         "Supports AutoencoderKL (SD 1.x / 2.x / SDXL)."
     )
 
@@ -1564,6 +1568,10 @@ class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         "Build TensorRT VAE engines for a single fixed resolution.\n\n"
         "Best performance — TRT fully optimizes for the exact dimensions. "
         "Only accepts inputs at this resolution.\n\n"
+        "NOTE: TRT VAE provides only marginal speedup (~1.2x) over the standard PyTorch VAE at "
+        "typical resolutions, while consuming significantly more VRAM (~3 GB vs ~160 MB for decode). "
+        "The benefit grows at higher resolutions where decode time becomes non-trivial. "
+        "For most workflows where UNet sampling dominates, TRT VAE has negligible impact on total time.\n\n"
         "Supports AutoencoderKL (SD 1.x / 2.x / SDXL)."
     )
 
