@@ -1091,9 +1091,9 @@ class TensorRTVAELoader:
         "Load pre-built VAE TensorRT engines (decode + optional encode). "
         "Engines are auto-discovered as matched pairs from the engine directory.\n\n"
         "NOTE: TRT VAE provides only marginal speedup (~1.2x) over the standard PyTorch VAE at "
-        "typical resolutions, while consuming significantly more VRAM (~3 GB vs ~160 MB for decode). "
-        "The benefit grows at higher resolutions where decode time becomes non-trivial. "
-        "For most workflows where UNet sampling dominates, TRT VAE has negligible impact on total time."
+        "typical resolutions. The benefit grows at higher resolutions where decode time becomes "
+        "non-trivial. For most workflows where UNet sampling dominates, TRT VAE has negligible "
+        "impact on total time."
     )
 
     def load_vae(self, engine):
