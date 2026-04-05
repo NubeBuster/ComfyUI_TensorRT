@@ -371,7 +371,7 @@ class TensorRTLoader:
         model = _create_model_for_type(model_type, unet)
         patcher = _wrap_trt_patcher(model, unet)
         # Expose source checkpoint name for usage tracking (e.g. LoRA Manager)
-        meta_path = unet_path + ".meta.json"
+        meta_path = unet_path.replace(".engine", ".meta.json")
         if os.path.isfile(meta_path):
             try:
                 with open(meta_path, "r", encoding="utf-8") as f:
