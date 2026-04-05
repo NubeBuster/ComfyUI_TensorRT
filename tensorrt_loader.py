@@ -16,6 +16,23 @@ import logging
 
 trt_logger = logging.getLogger("comfyui_tensorrt")
 
+# Wrap unload_all_models to signal that ON_DETACH should actually free engines.
+# Without this, ON_DETACH is a no-op (keeps engines hot for XY plot eviction).
+_trt_force_unload = False
+_original_unload_all = comfy.model_management.unload_all_models
+
+
+def _wrapped_unload_all():
+    global _trt_force_unload
+    _trt_force_unload = True
+    try:
+        _original_unload_all()
+    finally:
+        _trt_force_unload = False
+
+
+comfy.model_management.unload_all_models = _wrapped_unload_all
+
 
 def _vram_snapshot(label=""):
     """Log current VRAM usage for debugging model lifecycle."""
@@ -61,12 +78,8 @@ trt.init_libnvinfer_plugins(None, "")
 logger = trt.Logger(trt.Logger.INFO)
 runtime = trt.Runtime(logger)
 
-# Refit loader cache: skip redundant refit when patches haven't changed
-_refit_loader_cache = {
-    "patches_uuid": None,
-    "unet_name": None,
-    "patcher": None,
-}
+# Multi-slot refit cache: hash-based, supports LoRA cycling (A→B→A)
+from . import refit_cache as _rc
 
 
 def trt_datatype_to_torch(datatype):
@@ -432,16 +445,25 @@ def _wrap_trt_patcher(model, unet):
         _vram_snapshot("UNet ON_LOAD post")
 
     def _on_detach(p, _unpatch_all):
-        # Keep engine hot — avoid reload thrash during XY plots.
-        # TRT engines can't be partially unloaded like PyTorch models;
-        # unload+reload cycles cost ~4s each for deserialization.
-        engine_loaded = p.model.diffusion_model.engine is not None
-        trt_logger.info(
-            f"[lifecycle] UNet ON_DETACH called — keeping engine hot "
-            f"(engine_loaded={engine_loaded}, "
-            f"path={p.model.diffusion_model.engine_path})"
-        )
-        _vram_snapshot("UNet ON_DETACH")
+        if not _trt_force_unload:
+            trt_logger.info("[lifecycle] UNet ON_DETACH — keeping engine hot")
+            if trt_logger.isEnabledFor(logging.DEBUG):
+                import traceback
+
+                trt_logger.debug(
+                    "  caller: %s", "".join(traceback.format_stack()[-4:-1]).strip()
+                )
+            return
+        trt_logger.info("[lifecycle] UNet ON_DETACH — unloading engine (force)")
+        if trt_logger.isEnabledFor(logging.DEBUG):
+            import traceback
+
+            trt_logger.debug(
+                "  caller: %s", "".join(traceback.format_stack()[-4:-1]).strip()
+            )
+        _vram_snapshot("UNet ON_DETACH pre")
+        p.model.diffusion_model._unload()
+        _vram_snapshot("UNet ON_DETACH post")
 
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
     patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_DETACH, _on_detach)
@@ -480,7 +502,7 @@ class TensorRTRefitLoader:
                     "MODEL",
                     {
                         "tooltip": "Source model with LoRA/weights applied. Its weights are refitted into the TRT engine. "
-                        "Results are cached by patches_uuid — if LoRAs haven't changed, refit is skipped entirely."
+                        "Results are cached by a hash of the LoRA patches — cycling between LoRA configs (A→B→A) skips refitting on revisits."
                     },
                 ),
             },
@@ -502,8 +524,6 @@ class TensorRTRefitLoader:
         return float("NaN")
 
     def load_and_refit(self, unet_name, model_type, source_model):
-        global _refit_loader_cache
-
         if unet_name == _NO_REFIT_ENGINES:
             raise ValueError(
                 "No refit-enabled TRT engines found. Build an engine with "
@@ -513,32 +533,37 @@ class TensorRTRefitLoader:
         if not os.path.isfile(unet_path):
             raise FileNotFoundError(f"File {unet_path} does not exist")
 
-        # Cache check: skip refit if patches haven't changed
-        current_uuid = getattr(source_model, "patches_uuid", None)
-        if (
-            current_uuid is not None
-            and _refit_loader_cache["patches_uuid"] == current_uuid
-            and _refit_loader_cache["unet_name"] == unet_name
-            and _refit_loader_cache["patcher"] is not None
-        ):
-            cached_unet = _refit_loader_cache["patcher"].model.diffusion_model
-            if cached_unet.engine is not None:
-                trt_logger.info(
-                    "Refit: cache hit (patches_uuid unchanged), skipping refit"
-                )
-                return (_refit_loader_cache["patcher"],)
-            # Engine evicted — check persisted refitted engine still exists
-            if cached_unet.engine_path and os.path.isfile(cached_unet.engine_path):
-                trt_logger.info(
-                    "Refit: cache hit (evicted, reloading refitted engine on demand)"
-                )
-                return (_refit_loader_cache["patcher"],)
-            trt_logger.info(
-                "Refit: cache invalid (persisted engine missing), will re-refit"
-            )
-            _refit_loader_cache["patcher"] = None
+        # Cache check: hash-based multi-slot cache for LoRA cycling
+        lora_hash = _rc.compute_patches_hash(source_model)
+        disk_path = None
+        if lora_hash is not None:
+            cached_patcher = _rc.mem_lookup(unet_path, lora_hash)
+            if cached_patcher is not None:
+                return (cached_patcher,)
+
+            # Memory miss — check disk cache
+            disk_path = _rc.disk_lookup(unet_path, lora_hash)
+            if disk_path is not None:
+                trt_logger.info("Refit: disk cache hit, loading hash=%s", lora_hash)
+            else:
+                trt_logger.info("Refit: cache MISS (hash=%s not found)", lora_hash)
 
         pbar = comfy.utils.ProgressBar(4)
+
+        # Disk cache hit — load pre-refitted engine, skip full refit
+        if disk_path is not None:
+            pbar.update_absolute(1, 4)
+            _rc.mem_release_all_engines()
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache()
+            torch.cuda.empty_cache()
+            unet = TrTUnet(disk_path)
+            model = _create_model_for_type(model_type, unet)
+            patcher = _wrap_trt_patcher(model, unet)
+            _rc.mem_store(unet_path, lora_hash, patcher)
+            pbar.update_absolute(4, 4)
+            trt_logger.info("Refit: loaded from disk cache hash=%s", lora_hash)
+            return (patcher,)
 
         # --- Step 1: Extract LoRA-patched weights from source model ---
         pbar.update_absolute(0, 4)
@@ -734,11 +759,14 @@ class TensorRTRefitLoader:
             )
         trt_logger.info("Refit: engine weights updated successfully")
 
-        # Persist refitted engine so ON_LOAD can reload after VRAM eviction
-        try:
+        # Persist refitted engine with hash-based filename
+        if lora_hash is not None:
+            cached_path = _rc.disk_cache_path(unet_path, lora_hash)
+        else:
             cache_dir = os.path.join(os.path.dirname(unet_path), ".refit_cache")
             os.makedirs(cache_dir, exist_ok=True)
             cached_path = os.path.join(cache_dir, os.path.basename(unet_path))
+        try:
             data = unet.engine.serialize()
             with open(cached_path, "wb") as f:
                 f.write(data)
@@ -753,9 +781,8 @@ class TensorRTRefitLoader:
         model = _create_model_for_type(model_type, unet)
         patcher = _wrap_trt_patcher(model, unet)
 
-        _refit_loader_cache["patches_uuid"] = current_uuid
-        _refit_loader_cache["unet_name"] = unet_name
-        _refit_loader_cache["patcher"] = patcher
+        if lora_hash is not None:
+            _rc.mem_store(unet_path, lora_hash, patcher)
 
         pbar.update_absolute(4, 4)
         return (patcher,)
@@ -934,14 +961,28 @@ class TrtVAE:
             _vram_snapshot("VAE ON_LOAD post")
 
         def _on_detach(p, _unpatch_all):
-            # Keep engines hot — avoid reload thrash during XY plots
-            dec_loaded = decode_eng.engine is not None if decode_eng else None
-            enc_loaded = encode_eng.engine is not None if encode_eng else None
-            trt_logger.info(
-                f"[lifecycle] VAE ON_DETACH called — keeping engines hot "
-                f"(decode_loaded={dec_loaded}, encode_loaded={enc_loaded})"
-            )
-            _vram_snapshot("VAE ON_DETACH")
+            if not _trt_force_unload:
+                trt_logger.info("[lifecycle] VAE ON_DETACH — keeping engines hot")
+                if trt_logger.isEnabledFor(logging.DEBUG):
+                    import traceback
+
+                    trt_logger.debug(
+                        "  caller: %s", "".join(traceback.format_stack()[-4:-1]).strip()
+                    )
+                return
+            trt_logger.info("[lifecycle] VAE ON_DETACH — unloading engines (force)")
+            if trt_logger.isEnabledFor(logging.DEBUG):
+                import traceback
+
+                trt_logger.debug(
+                    "  caller: %s", "".join(traceback.format_stack()[-4:-1]).strip()
+                )
+            _vram_snapshot("VAE ON_DETACH pre")
+            if decode_eng:
+                decode_eng._unload()
+            if encode_eng:
+                encode_eng._unload()
+            _vram_snapshot("VAE ON_DETACH post")
 
         self.patcher.add_callback(comfy.patcher_extension.CallbacksMP.ON_LOAD, _on_load)
         self.patcher.add_callback(

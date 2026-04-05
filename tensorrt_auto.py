@@ -1,6 +1,7 @@
 """TensorRT Loader Auto — combined build + load + refit node."""
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -26,12 +27,8 @@ AUTO_MODEL_TYPES = [
     "sd2.x-768v",
 ]
 
-# Engine cache: skip redundant refit when patches haven't changed
-_refit_cache = {
-    "patches_uuid": None,
-    "engine_path": None,
-    "patcher": None,
-}
+# Multi-slot refit cache: hash-based, supports LoRA cycling (A→B→A)
+from . import refit_cache as _rc
 
 # Engine load cache: skip re-probing when engine path hasn't changed
 _engine_cache = {
@@ -52,8 +49,14 @@ def _refit_cache_dir():
     return d
 
 
-def _refit_cache_path(engine_path):
-    """Return the path for a persisted refitted engine."""
+def _refit_cache_path(engine_path, lora_hash=None):
+    """Return the path for a persisted refitted engine.
+
+    If lora_hash is provided, returns the hash-specific path.
+    Otherwise returns the legacy single-slot path (for eviction compatibility).
+    """
+    if lora_hash is not None:
+        return _rc.disk_cache_path(engine_path, lora_hash)
     stem = os.path.basename(engine_path)
     return os.path.join(_refit_cache_dir(), stem)
 
@@ -237,10 +240,17 @@ def _evict_engine(path, size):
         sidecar = path.replace(".engine", suffix)
         if os.path.isfile(sidecar) and not os.path.islink(sidecar):
             os.remove(sidecar)
-    # Clean up persisted refit cache
+    # Clean up persisted refit cache (legacy single-slot + hash-based multi-slot)
     cached = _refit_cache_path(path)
     if os.path.isfile(cached):
         os.remove(cached)
+    # Also remove hash-based cache files for this engine
+    import glob as globmod
+
+    stem = os.path.splitext(os.path.basename(path))[0]
+    for f in globmod.glob(os.path.join(_refit_cache_dir(), f"{stem}_*.engine")):
+        log.info("Auto: evicting hash-cached refit %s", os.path.basename(f))
+        os.remove(f)
     return (os.path.basename(path), size)
 
 
@@ -689,8 +699,13 @@ class TensorRTLoaderAuto:
             return []
         return ["model"]
 
-    RETURN_TYPES = ("MODEL", "STRING")
-    RETURN_NAMES = ("model", "info")
+    RETURN_TYPES = ("MODEL", "STRING", "STRING")
+    RETURN_NAMES = ("model", "info", "model_hash")
+    OUTPUT_TOOLTIPS = (
+        "The TensorRT-accelerated model.",
+        "JSON metadata about the loaded engine.",
+        "Deterministic hash of model identity: checkpoint name, model type, shape profile, and LoRA patches. Stable across restarts and cache clears.",
+    )
     FUNCTION = "execute"
     CATEGORY = "TensorRT"
     DESCRIPTION = (
@@ -728,7 +743,7 @@ class TensorRTLoaderAuto:
         prompt=None,
         unique_id=None,
     ):
-        global _refit_cache, _engine_cache
+        global _engine_cache
         import comfy.model_management
         import comfy.utils
         from .tensorrt_convert import (
@@ -893,66 +908,43 @@ class TensorRTLoaderAuto:
         # Step 2: Check caches
         pbar.update_absolute(1, 4)
         has_patches = refit and hasattr(model, "patches") and len(model.patches) > 0
-        current_uuid = getattr(model, "patches_uuid", None) if has_patches else None
+        lora_hash = _rc.compute_patches_hash(model) if has_patches else None
+
+        # Deterministic identity hash: base model + shape profile + LoRA state
+        _id_h = hashlib.sha256()
+        _id_h.update((derived_model_name or "").encode())
+        _id_h.update(model_type.encode())
+        _id_h.update(profile_desc.encode())
+        _id_h.update(str(refit).encode())
+        if lora_hash is not None:
+            _id_h.update(lora_hash.encode())
+        model_hash = _id_h.hexdigest()[:16]
 
         log.info(
             f"Auto: cache check — has_patches={has_patches}, "
-            f"current_uuid={current_uuid}, engine_path={engine_path}"
-        )
-        log.info(
-            f"Auto: refit_cache state — uuid={_refit_cache['patches_uuid']}, "
-            f"path={_refit_cache['engine_path']}, "
-            f"patcher={'set' if _refit_cache['patcher'] else 'None'}"
-        )
-        log.info(
-            f"Auto: engine_cache state — path={_engine_cache['engine_path']}, "
-            f"patcher={'set' if _engine_cache['patcher'] else 'None'}"
+            f"lora_hash={lora_hash}, engine_path={engine_path}"
         )
 
-        if (
-            has_patches
-            and current_uuid is not None
-            and _refit_cache["patches_uuid"] == current_uuid
-            and _refit_cache["engine_path"] == engine_path
-            and _refit_cache["patcher"] is not None
-        ):
-            cached_unet = _refit_cache["patcher"].model.diffusion_model
-            if cached_unet.engine is not None:
-                log.info(
-                    "Auto: refit cache hit (patches_uuid unchanged), skipping refit"
-                )
+        disk_path = None
+        if has_patches and lora_hash is not None:
+            cached_patcher = _rc.mem_lookup(engine_path, lora_hash)
+            if cached_patcher is not None:
+                # If engine was evicted from VRAM, release other cached engines
+                # so there's VRAM available when ON_LOAD reloads from disk.
+                cached_unet = cached_patcher.model.diffusion_model
+                if cached_unet.engine is None:
+                    _rc.mem_release_all_engines()
                 _send_trt_progress("cached")
-                return (_refit_cache["patcher"], _build_info(engine_path))
-            # Engine evicted from VRAM but patches unchanged — check that
-            # the persisted refitted engine still exists on disk.
-            if cached_unet.engine_path and os.path.isfile(cached_unet.engine_path):
+                return (cached_patcher, _build_info(engine_path), model_hash)
+
+            # Memory miss — check disk cache (engine from a previous session)
+            disk_path = _rc.disk_lookup(engine_path, lora_hash)
+            if disk_path is not None:
                 log.info(
-                    "Auto: refit cache hit (evicted, reloading refitted engine on demand)"
+                    "Auto: disk cache hit, loading refitted engine hash=%s", lora_hash
                 )
-                _send_trt_progress("cached")
-                return (_refit_cache["patcher"], _build_info(engine_path))
-            log.info(
-                "Auto: refit cache invalid (persisted engine missing), will re-refit"
-            )
-            _refit_cache["patcher"] = None
-        elif has_patches:
-            # Log why refit cache missed
-            reasons = []
-            if current_uuid is None:
-                reasons.append("current_uuid is None")
-            if _refit_cache["patches_uuid"] != current_uuid:
-                reasons.append(
-                    f"uuid mismatch (cached={_refit_cache['patches_uuid']} "
-                    f"vs current={current_uuid})"
-                )
-            if _refit_cache["engine_path"] != engine_path:
-                reasons.append(
-                    f"path mismatch (cached={_refit_cache['engine_path']} "
-                    f"vs current={engine_path})"
-                )
-            if _refit_cache["patcher"] is None:
-                reasons.append("cached patcher is None")
-            log.info(f"Auto: refit cache MISS — {'; '.join(reasons)}")
+            else:
+                log.info("Auto: refit cache MISS (hash=%s not found)", lora_hash)
 
         if (
             not has_patches
@@ -963,7 +955,7 @@ class TensorRTLoaderAuto:
             if cached_unet.engine is not None:
                 log.info("Auto: engine cache hit (no refit needed)")
                 _send_trt_progress("cached")
-                return (_engine_cache["patcher"], _build_info(engine_path))
+                return (_engine_cache["patcher"], _build_info(engine_path), model_hash)
             log.info("Auto: engine cache stale (engine evicted from VRAM), will reload")
             _engine_cache["patcher"] = None
 
@@ -973,20 +965,19 @@ class TensorRTLoaderAuto:
         import torch
         from .tensorrt_loader import _vram_snapshot
 
-        # Explicitly release old TRT engines held by our caches.
-        # TRT allocates VRAM outside PyTorch, so unload_all_models() and
-        # torch.cuda.empty_cache() can't free it — we must call _unload().
+        # Release old TRT engines held by our caches.
+        # TRT allocates VRAM outside PyTorch — we must call _unload() explicitly.
         _vram_snapshot("Auto pre-release-old-engines")
-        for cache_name, cache in [("refit", _refit_cache), ("engine", _engine_cache)]:
-            if cache.get("patcher") is not None:
-                old_unet = cache["patcher"].model.diffusion_model
-                log.info(
-                    f"Auto: releasing old {cache_name} cache engine "
-                    f"(loaded={old_unet.engine is not None}, "
-                    f"path={old_unet.engine_path})"
-                )
-                old_unet._unload()
-                cache["patcher"] = None
+        _rc.mem_release_all_engines()
+        if _engine_cache.get("patcher") is not None:
+            old_unet = _engine_cache["patcher"].model.diffusion_model
+            log.info(
+                f"Auto: releasing old engine cache "
+                f"(loaded={old_unet.engine is not None}, "
+                f"path={old_unet.engine_path})"
+            )
+            old_unet._unload()
+            _engine_cache["patcher"] = None
 
         # Free VRAM before probe — TrTUnet.__init__ deserializes the engine
         # to read device_memory_size, which needs the full engine in GPU memory.
@@ -996,6 +987,19 @@ class TensorRTLoaderAuto:
         comfy.model_management.soft_empty_cache()
         torch.cuda.empty_cache()
         _vram_snapshot("Auto post-empty_cache (about to probe)")
+
+        # If disk cache hit, load from the refitted engine directly
+        if has_patches and disk_path is not None:
+            _send_trt_progress("loading cached refit")
+            unet = TrTUnet(disk_path)
+            model_shell = _create_model_for_type(model_type, unet)
+            patcher = _wrap_trt_patcher(model_shell, unet)
+            _rc.mem_store(engine_path, lora_hash, patcher)
+            pbar.update_absolute(4, 4)
+            _send_trt_progress("done")
+            log.info("Auto: loaded refitted engine from disk cache hash=%s", lora_hash)
+            return (patcher, _build_info(engine_path), model_hash)
+
         unet = TrTUnet(engine_path)
         model_shell = _create_model_for_type(model_type, unet)
         patcher = _wrap_trt_patcher(model_shell, unet)
@@ -1010,9 +1014,18 @@ class TensorRTLoaderAuto:
             unet._load()
             _do_refit(unet.engine, engine_path, model, model_type)
 
-            # Persist refitted engine so ON_LOAD can reload it after VRAM eviction
-            # without needing to re-refit (saves ~13s per prompt for SDXL)
-            cached_path = _refit_cache_path(engine_path)
+            # Persist refitted engine with hash-based filename
+            # Ensure disk space before writing (~5GB for SDXL)
+            estimated_size = 5 * 1024**3
+            if disk_management == "max_disk_usage":
+                _fifo_evict_max_usage(
+                    auto_dir, int(threshold_gb * 1024**3), estimated_size
+                )
+            elif disk_management == "min_disk_free":
+                _fifo_evict_min_free(
+                    auto_dir, int(threshold_gb * 1024**3), estimated_size
+                )
+            cached_path = _refit_cache_path(engine_path, lora_hash)
             try:
                 data = unet.engine.serialize()
                 with open(cached_path, "wb") as f:
@@ -1023,13 +1036,11 @@ class TensorRTLoaderAuto:
             except Exception as e:
                 log.warning("Auto: failed to persist refitted engine: %s", e)
 
-            _refit_cache["patches_uuid"] = current_uuid
-            _refit_cache["engine_path"] = engine_path
-            _refit_cache["patcher"] = patcher
+            _rc.mem_store(engine_path, lora_hash, patcher)
         else:
             _engine_cache["engine_path"] = engine_path
             _engine_cache["patcher"] = patcher
 
         pbar.update_absolute(4, 4)
         _send_trt_progress("done")
-        return (patcher, _build_info(engine_path))
+        return (patcher, _build_info(engine_path), model_hash)

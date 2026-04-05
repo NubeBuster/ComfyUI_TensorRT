@@ -34,7 +34,7 @@ The 722 MatMul weights are the attention projections (to_q, to_k, to_v, to_out, 
 
 ### How long do refitted engines persist?
 
-Refitted engines are cached to disk in a `.refit_cache/` directory alongside the base engine. After the first refit, subsequent runs with the same LoRA patches skip refitting entirely — even after VRAM eviction. The cache is invalidated automatically when LoRA patches change (detected via `patches_uuid`).
+Refitted engines are cached to disk in a `.refit_cache/` directory alongside the base engine. Each LoRA configuration gets its own cached engine file (keyed by a deterministic hash of the patches). After the first refit, subsequent runs with the same LoRA config skip refitting entirely — even after VRAM eviction or restart.
 
 ### What happens on VRAM eviction?
 
@@ -75,6 +75,32 @@ The Auto node handles building, loading, matching, and caching automatically.
 5. Change LoRA/strength/stack → rerun → ~13 seconds again
 
 CLIP and text encoding still use the normal LoRA pipeline — only the UNet is TRT-accelerated.
+
+## XY Plots / Batch Sampling
+
+TRT engines stay hot during XY plot iterations. ComfyUI's memory manager evicts models via `free_memory()` during temporary swaps (e.g. loading VAE evicts UNet, then UNet reloads). The TRT lifecycle hooks detect this isn't a full unload and skip engine teardown — engines remain in VRAM and reload instantly with no deserialization cost.
+
+Full unloads ("Clear All Models" button, LoRA cache miss in Auto loader) go through `unload_all_models()`, which sets a force flag that ON_DETACH checks. Only then are engines actually freed from VRAM.
+
+### VRAM lifecycle
+
+| Scenario | ON_DETACH behavior | Cost |
+|----------|-------------------|------|
+| XY plot model swap | Keep hot | 0s (instant) |
+| Re-queue same prompt | Keep hot | 0s |
+| Clear All Models | Unload | 0s (immediate VRAM release) |
+| LoRA change (Auto) | Unload (cache miss path) | ~2-4s if cached, ~13s if new |
+
+### Refit cache (multi-slot, hash-based)
+
+The refit cache uses a **deterministic hash** of the LoRA patches (key names, strengths, tensor fingerprints) instead of ComfyUI's random `patches_uuid`. This enables multi-slot caching:
+
+- **Same LoRA, re-queue**: cache hit, no refit (instant)
+- **LoRA A → B → A**: cache hit on return to A (~2-4s deserialize instead of ~13s refit)
+- **Disk cache**: multiple files per base engine (`<engine>_<hash>.engine`), one per LoRA config
+- **Memory + disk**: in-memory cache for VRAM-hot engines, disk cache survives restarts
+
+Disk cache files are managed by the existing FIFO eviction system — refit cache files are purged first (expendable, ~13s to rebuild) before base engines.
 
 ## Limitations
 
