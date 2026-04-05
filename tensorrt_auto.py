@@ -13,9 +13,16 @@ from server import PromptServer
 log = logging.getLogger("comfyui_tensorrt")
 
 
-def _send_trt_progress(phase):
+def _send_trt_progress(phase, elapsed_s=None, eta_s=None, **extra):
     """Send progress event to frontend toast."""
-    PromptServer.instance.send_sync("trt_auto_progress", {"phase": phase})
+    payload = {"phase": phase}
+    if elapsed_s is not None:
+        payload["elapsed_s"] = round(elapsed_s, 1)
+    if eta_s is not None:
+        payload["eta_s"] = round(eta_s, 1)
+    payload.update(extra)
+    log.info("Toast WS payload: %s", payload)
+    PromptServer.instance.send_sync("trt_auto_progress", payload)
 
 
 # Model types supported by the auto node (no SVD/Flux yet)
@@ -29,6 +36,7 @@ AUTO_MODEL_TYPES = [
 
 # Multi-slot refit cache: hash-based, supports LoRA cycling (A→B→A)
 from . import refit_cache as _rc
+from . import trt_timing
 
 # Engine load cache: skip re-probing when engine path hasn't changed
 _engine_cache = {
@@ -753,6 +761,9 @@ class TensorRTLoaderAuto:
         )
         from .tensorrt_loader import TrTUnet, _create_model_for_type, _wrap_trt_patcher
 
+        import time as _time
+
+        _exec_start = _time.time()
         pbar = comfy.utils.ProgressBar(4)
 
         # Resolve {modelname} placeholder
@@ -811,7 +822,13 @@ class TensorRTLoaderAuto:
             engine_path = os.path.join(auto_dir, engine_filename)
 
             log.info("Auto: building engine — this takes 5-10 minutes for SDXL...")
-            _send_trt_progress("building")
+            _build_res = (
+                f"{opt_height}x{opt_width}"
+                if static_shapes != "static"
+                else f"{height}x{width}"
+            )
+            _build_eta = trt_timing.estimate_eta("build_unet", model_type, _build_res)
+            _send_trt_progress("building", elapsed_s=0, eta_s=_build_eta)
 
             evicted = []
             if disk_management == "max_disk_usage":
@@ -933,8 +950,17 @@ class TensorRTLoaderAuto:
                 # so there's VRAM available when ON_LOAD reloads from disk.
                 cached_unet = cached_patcher.model.diffusion_model
                 if cached_unet.engine is None:
+                    log.info("Auto: cache hit (evicted, will reload on inference)")
                     _rc.mem_release_all_engines()
-                _send_trt_progress("cached")
+                else:
+                    log.info("Auto: cache hit (VRAM resident)")
+                _send_trt_progress(
+                    "cached",
+                    elapsed_s=_time.time() - _exec_start,
+                    model_name=derived_model_name or filename_prefix,
+                    model_type=model_type,
+                    source="memory cache",
+                )
                 return (cached_patcher, _build_info(engine_path), model_hash)
 
             # Memory miss — check disk cache (engine from a previous session)
@@ -954,16 +980,52 @@ class TensorRTLoaderAuto:
             cached_unet = _engine_cache["patcher"].model.diffusion_model
             if cached_unet.engine is not None:
                 log.info("Auto: engine cache hit (no refit needed)")
-                _send_trt_progress("cached")
+                _send_trt_progress(
+                    "cached",
+                    elapsed_s=_time.time() - _exec_start,
+                    model_name=derived_model_name or filename_prefix,
+                    model_type=model_type,
+                    source="memory cache",
+                )
                 return (_engine_cache["patcher"], _build_info(engine_path), model_hash)
             log.info("Auto: engine cache stale (engine evicted from VRAM), will reload")
             _engine_cache["patcher"] = None
 
         # Step 3: Load engine
         pbar.update_absolute(2, 4)
-        _send_trt_progress("loading")
+        _engine_name = os.path.basename(engine_path)
         import torch
         from .tensorrt_loader import _vram_snapshot
+
+        # Compute ETA: combined load+refit for full refit, load-only for disk cache hit
+        _load_eta = trt_timing.estimate_eta("load_engine", model_type)
+        _needs_full_refit = has_patches and disk_path is None
+        _refit_eta = (
+            trt_timing.estimate_eta("refit", model_type) if _needs_full_refit else None
+        )
+        if _load_eta is not None and _refit_eta is not None:
+            _op_eta = _load_eta + _refit_eta
+        elif _load_eta is not None:
+            _op_eta = _load_eta
+        elif _refit_eta is not None:
+            _op_eta = _refit_eta
+        else:
+            _op_eta = None
+        log.info(
+            "Auto: ETA — load=%s refit=%s combined=%s (full_refit=%s)",
+            _load_eta,
+            _refit_eta,
+            _op_eta,
+            _needs_full_refit,
+        )
+
+        _send_trt_progress("loading", elapsed_s=0, eta_s=_op_eta)
+
+        _load_timing_id = trt_timing.begin_event(
+            "load_engine",
+            model_name=_engine_name,
+            model_type=model_type,
+        )
 
         # Release old TRT engines held by our caches.
         # TRT allocates VRAM outside PyTorch — we must call _unload() explicitly.
@@ -988,19 +1050,34 @@ class TensorRTLoaderAuto:
         torch.cuda.empty_cache()
         _vram_snapshot("Auto post-empty_cache (about to probe)")
 
+        # Done payload shared fields
+        _done_info = {
+            "model_name": derived_model_name or filename_prefix,
+            "model_type": model_type,
+            "profile": profile_desc,
+            "eta_s": round(_op_eta, 1) if _op_eta is not None else None,
+        }
+
         # If disk cache hit, load from the refitted engine directly
         if has_patches and disk_path is not None:
             _send_trt_progress("loading cached refit")
             unet = TrTUnet(disk_path)
+            trt_timing.end_event(_load_timing_id, "success")
             model_shell = _create_model_for_type(model_type, unet)
             patcher = _wrap_trt_patcher(model_shell, unet)
             _rc.mem_store(engine_path, lora_hash, patcher)
             pbar.update_absolute(4, 4)
-            _send_trt_progress("done")
+            _send_trt_progress(
+                "done",
+                elapsed_s=_time.time() - _exec_start,
+                source="disk cache",
+                **_done_info,
+            )
             log.info("Auto: loaded refitted engine from disk cache hash=%s", lora_hash)
             return (patcher, _build_info(engine_path), model_hash)
 
         unet = TrTUnet(engine_path)
+        trt_timing.end_event(_load_timing_id, "success")
         model_shell = _create_model_for_type(model_type, unet)
         patcher = _wrap_trt_patcher(model_shell, unet)
 
@@ -1008,11 +1085,23 @@ class TensorRTLoaderAuto:
         pbar.update_absolute(3, 4)
         if has_patches:
             log.info("Auto: refitting with LoRA patches...")
+            # Phase text update only — ETA/elapsed continue from initial send
             _send_trt_progress("refitting")
+            _refit_timing_id = trt_timing.begin_event(
+                "refit",
+                model_name=_engine_name,
+                model_type=model_type,
+                lora_hash=lora_hash,
+            )
 
             # Refit in-place — preserves engine_path so ON_LOAD can reload from disk
             unet._load()
-            _do_refit(unet.engine, engine_path, model, model_type)
+            try:
+                _do_refit(unet.engine, engine_path, model, model_type)
+            except Exception as e:
+                trt_timing.end_event(_refit_timing_id, "failed", str(e))
+                raise
+            trt_timing.end_event(_refit_timing_id, "success")
 
             # Persist refitted engine with hash-based filename
             # Ensure disk space before writing (~5GB for SDXL)
@@ -1042,5 +1131,8 @@ class TensorRTLoaderAuto:
             _engine_cache["patcher"] = patcher
 
         pbar.update_absolute(4, 4)
-        _send_trt_progress("done")
+        _source = "refit" if has_patches else "load"
+        _send_trt_progress(
+            "done", elapsed_s=_time.time() - _exec_start, source=_source, **_done_info
+        )
         return (patcher, _build_info(engine_path), model_hash)

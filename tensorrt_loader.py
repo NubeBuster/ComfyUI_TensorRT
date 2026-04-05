@@ -16,6 +16,8 @@ import logging
 
 trt_logger = logging.getLogger("comfyui_tensorrt")
 
+from . import trt_timing
+
 # Wrap unload_all_models to signal that ON_DETACH should actually free engines.
 # Without this, ON_DETACH is a no-op (keeps engines hot for XY plot eviction).
 _trt_force_unload = False
@@ -553,11 +555,17 @@ class TensorRTRefitLoader:
         # Disk cache hit — load pre-refitted engine, skip full refit
         if disk_path is not None:
             pbar.update_absolute(1, 4)
+            _load_tid = trt_timing.begin_event(
+                "load_engine",
+                model_name=unet_name,
+                model_type=model_type,
+            )
             _rc.mem_release_all_engines()
             comfy.model_management.unload_all_models()
             comfy.model_management.soft_empty_cache()
             torch.cuda.empty_cache()
             unet = TrTUnet(disk_path)
+            trt_timing.end_event(_load_tid, "success")
             model = _create_model_for_type(model_type, unet)
             patcher = _wrap_trt_patcher(model, unet)
             _rc.mem_store(unet_path, lora_hash, patcher)
@@ -645,13 +653,25 @@ class TensorRTRefitLoader:
         # --- Step 2: Load TRT engine (preserves engine_path for reload) ---
         pbar.update_absolute(1, 4)
         trt_logger.info(f"Refit: loading engine: {unet_path}")
+        _load_tid = trt_timing.begin_event(
+            "load_engine",
+            model_name=unet_name,
+            model_type=model_type,
+        )
         torch.cuda.empty_cache()
         unet = TrTUnet(unet_path)
         unet._load()
+        trt_timing.end_event(_load_tid, "success")
 
         # --- Step 3: Refit weights in-place ---
         pbar.update_absolute(2, 4)
         trt_logger.info("Refit: applying weights to engine...")
+        _refit_tid = trt_timing.begin_event(
+            "refit",
+            model_name=unet_name,
+            model_type=model_type,
+            lora_hash=lora_hash,
+        )
         engine = unet.engine
         refitter = trt.Refitter(engine, logger)
 
@@ -754,9 +774,13 @@ class TensorRTRefitLoader:
         success = refitter.refit_cuda_engine()
         del refitter, cpu_weights
         if not success:
+            trt_timing.end_event(
+                _refit_tid, "failed", "refit_cuda_engine returned False"
+            )
             raise RuntimeError(
                 "TensorRT engine refit failed. Check the log for details."
             )
+        trt_timing.end_event(_refit_tid, "success")
         trt_logger.info("Refit: engine weights updated successfully")
 
         # Persist refitted engine with hash-based filename
@@ -876,7 +900,13 @@ class TrTVae(TrTEngine):
         Mirrors the allocate_buffers + infer pattern from Engine (trt_engine.py):
         pre-allocate contiguous I/O buffers, copy input, execute, return output.
         """
-        self._load()
+        if self.engine is None:
+            _vae_name = os.path.basename(self.engine_path)
+            _vae_tid = trt_timing.begin_event("load_engine", model_name=_vae_name)
+            self._load()
+            trt_timing.end_event(_vae_tid, "success")
+        else:
+            self._load()  # no-op when already loaded
 
         # Allocate contiguous I/O buffers (same pattern as Engine.allocate_buffers)
         in_dtype = trt_datatype_to_torch(self.engine.get_tensor_dtype("input"))

@@ -12,6 +12,8 @@ import tensorrt as trt
 import folder_paths
 from tqdm import tqdm
 
+from . import trt_timing
+
 log = logging.getLogger(__name__)
 
 # TODO:
@@ -364,7 +366,7 @@ def build_unet_engine(
         timing_cache = config.create_timing_cache(buffer)
         config.set_timing_cache(timing_cache, ignore_mismatch=True)
 
-    config.progress_monitor = TQDMProgressMonitor()
+    config.progress_monitor = ToastProgressMonitor()
 
     for k in range(len(input_names)):
         profile.set_shape(
@@ -383,11 +385,28 @@ def build_unet_engine(
 
     config.add_optimization_profile(profile)
 
-    serialized_engine = builder.build_serialized_network(network, config)
-    if serialized_engine is None:
-        # Check if this was due to user interrupt
-        comfy.model_management.throw_exception_if_processing_interrupted()
-        raise RuntimeError("TensorRT engine build failed — serialized_engine is None.")
+    _model_name = os.path.splitext(os.path.basename(output_engine_path))[0]
+    _resolution = f"{height_opt}x{width_opt}"
+    _timing_id = trt_timing.begin_event(
+        "build_unet",
+        model_name=_model_name,
+        resolution=_resolution,
+        batch_size=batch_size_opt,
+    )
+    try:
+        serialized_engine = builder.build_serialized_network(network, config)
+        if serialized_engine is None:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            raise RuntimeError(
+                "TensorRT engine build failed — serialized_engine is None."
+            )
+    except comfy.model_management.InterruptProcessingException:
+        trt_timing.end_event(_timing_id, "interrupted", "User cancelled")
+        raise
+    except Exception as e:
+        trt_timing.end_event(_timing_id, "failed", str(e))
+        raise
+    trt_timing.end_event(_timing_id, "success")
 
     os.makedirs(os.path.dirname(output_engine_path), exist_ok=True)
     with open(output_engine_path, "wb") as f:
@@ -490,6 +509,51 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
         except KeyboardInterrupt:
             # There is no need to propagate this exception to TensorRT. We can simply cancel the build.
             return False
+
+
+class ToastProgressMonitor(TQDMProgressMonitor):
+    """Extends TQDMProgressMonitor to also send build progress to the frontend toast."""
+
+    def __init__(self):
+        super().__init__()
+        self._top_phases = []  # ordered list of top-level phase names
+        self._phase_totals = {}  # phase_name -> num_steps
+
+    def phase_start(self, phase_name, parent_phase, num_steps):
+        super().phase_start(phase_name, parent_phase, num_steps)
+        self._phase_totals[phase_name] = num_steps
+        if parent_phase is None:
+            self._top_phases.append(phase_name)
+
+    def phase_finish(self, phase_name):
+        super().phase_finish(phase_name)
+
+    def step_complete(self, phase_name, step):
+        result = super().step_complete(phase_name, step)
+        # Send progress for top-level phases only (avoid flooding with sub-phases)
+        if phase_name in self._phase_totals:
+            total = self._phase_totals[phase_name]
+            phase_idx = (
+                self._top_phases.index(phase_name)
+                if phase_name in self._top_phases
+                else -1
+            )
+            try:
+                from server import PromptServer
+
+                PromptServer.instance.send_sync(
+                    "trt_build_progress",
+                    {
+                        "phase_name": phase_name,
+                        "step": step,
+                        "step_total": total,
+                        "phase_idx": phase_idx + 1 if phase_idx >= 0 else 0,
+                        "phase_count": len(self._top_phases),
+                    },
+                )
+            except Exception:
+                pass
+        return result
 
 
 # Known loader class_type -> input key that holds the model filename
@@ -1210,7 +1274,7 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
             config = builder.create_builder_config()
             profile = builder.create_optimization_profile()
             self._setup_timing_cache(config)
-            config.progress_monitor = TQDMProgressMonitor()
+            config.progress_monitor = ToastProgressMonitor()
 
             profile.set_shape("input", shape_min, shape_opt, shape_max)
             if dtype == torch.float16:
@@ -1248,9 +1312,22 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
                 os.path.join(self.output_dir, os.path.dirname(filename_prefix)),
                 exist_ok=True,
             )
-            serialized_engine = builder.build_serialized_network(network, config)
-            if serialized_engine is None:
-                raise RuntimeError(f"TensorRT engine build failed for VAE {operation}")
+            _vae_resolution = f"{height_opt}x{width_opt}"
+            _vae_timing_id = trt_timing.begin_event(
+                "build_vae",
+                model_name=filename_prefix,
+                resolution=_vae_resolution,
+            )
+            try:
+                serialized_engine = builder.build_serialized_network(network, config)
+                if serialized_engine is None:
+                    raise RuntimeError(
+                        f"TensorRT engine build failed for VAE {operation}"
+                    )
+            except Exception as e:
+                trt_timing.end_event(_vae_timing_id, "failed", str(e))
+                raise
+            trt_timing.end_event(_vae_timing_id, "success")
 
             full_output_folder, filename, counter, subfolder, filename_prefix = (
                 folder_paths.get_save_image_path(filename_prefix, self.output_dir)
