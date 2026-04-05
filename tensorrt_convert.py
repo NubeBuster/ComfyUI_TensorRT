@@ -1181,6 +1181,9 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
         width_min,
         width_opt,
         width_max,
+        batch_size_min,
+        batch_size_opt,
+        batch_size_max,
         is_static,
     ):
         output_onnx = os.path.normpath(
@@ -1209,23 +1212,27 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
         if operation == "encode":
             wrapper = VAEEncoderWrapper(first_stage.encoder, first_stage.quant_conv)
             wrapper.eval()
-            dummy = torch.randn(1, 3, height_opt, width_opt, device=device)
+            dummy = torch.randn(batch_size_opt, 3, height_opt, width_opt, device=device)
             input_names = ["input"]
             output_names = ["output"]
             dynamic_axes = {
                 "input": {0: "batch", 2: "height", 3: "width"},
                 "output": {0: "batch", 2: "latent_height", 3: "latent_width"},
             }
-            shape_min = (1, 3, height_min, width_min)
-            shape_opt = (1, 3, height_opt, width_opt)
-            shape_max = (1, 3, height_max, width_max)
+            shape_min = (batch_size_min, 3, height_min, width_min)
+            shape_opt = (batch_size_opt, 3, height_opt, width_opt)
+            shape_max = (batch_size_max, 3, height_max, width_max)
         else:  # decode
             wrapper = VAEDecoderWrapper(
                 first_stage.post_quant_conv, first_stage.decoder
             )
             wrapper.eval()
             dummy = torch.randn(
-                1, latent_channels, height_opt // 8, width_opt // 8, device=device
+                batch_size_opt,
+                latent_channels,
+                height_opt // 8,
+                width_opt // 8,
+                device=device,
             )
             input_names = ["input"]
             output_names = ["output"]
@@ -1233,9 +1240,24 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
                 "input": {0: "batch", 2: "latent_height", 3: "latent_width"},
                 "output": {0: "batch", 2: "height", 3: "width"},
             }
-            shape_min = (1, latent_channels, height_min // 8, width_min // 8)
-            shape_opt = (1, latent_channels, height_opt // 8, width_opt // 8)
-            shape_max = (1, latent_channels, height_max // 8, width_max // 8)
+            shape_min = (
+                batch_size_min,
+                latent_channels,
+                height_min // 8,
+                width_min // 8,
+            )
+            shape_opt = (
+                batch_size_opt,
+                latent_channels,
+                height_opt // 8,
+                width_opt // 8,
+            )
+            shape_max = (
+                batch_size_max,
+                latent_channels,
+                height_max // 8,
+                width_max // 8,
+            )
 
         os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
         with _disable_comfy_cast(wrapper):
@@ -1287,7 +1309,17 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
                 filename_prefix = "{}_{}_${}".format(
                     filename_prefix,
                     operation,
-                    "-".join(("stat", "h", str(height_opt), "w", str(width_opt))),
+                    "-".join(
+                        (
+                            "stat",
+                            "b",
+                            str(batch_size_opt),
+                            "h",
+                            str(height_opt),
+                            "w",
+                            str(width_opt),
+                        )
+                    ),
                 )
             else:
                 filename_prefix = "{}_{}_${}".format(
@@ -1296,6 +1328,10 @@ class VAE_TRT_CONVERSION_BASE(TRT_MODEL_CONVERSION_BASE):
                     "-".join(
                         (
                             "dyn",
+                            "b",
+                            str(batch_size_min),
+                            str(batch_size_max),
+                            str(batch_size_opt),
                             "h",
                             str(height_min),
                             str(height_max),
@@ -1446,6 +1482,36 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                         "tooltip": "Highest width the engine will accept. Wider range = more VRAM.",
                     },
                 ),
+                "batch_size_min": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 100,
+                        "step": 1,
+                        "tooltip": "Lowest batch size the engine will accept.",
+                    },
+                ),
+                "batch_size_opt": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 100,
+                        "step": 1,
+                        "tooltip": "Batch size TRT optimizes kernel selection for. Best performance at this value.",
+                    },
+                ),
+                "batch_size_max": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 100,
+                        "step": 1,
+                        "tooltip": "Highest batch size the engine will accept. Wider range = more VRAM.",
+                    },
+                ),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -1458,6 +1524,9 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         vae,
         operation,
         filename_prefix,
+        batch_size_min,
+        batch_size_opt,
+        batch_size_max,
         height_min,
         height_opt,
         height_max,
@@ -1482,6 +1551,9 @@ class DYNAMIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                 width_min,
                 width_opt,
                 width_max,
+                batch_size_min,
+                batch_size_opt,
+                batch_size_max,
                 is_static=False,
             )
         return ()
@@ -1541,6 +1613,16 @@ class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                         "tooltip": "Fixed width in pixels.",
                     },
                 ),
+                "batch_size": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 100,
+                        "step": 1,
+                        "tooltip": "Fixed batch size for the engine.",
+                    },
+                ),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -1555,6 +1637,7 @@ class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
         filename_prefix,
         height_opt,
         width_opt,
+        batch_size,
         prompt=None,
         unique_id=None,
     ):
@@ -1573,6 +1656,9 @@ class STATIC_VAE_TRT_CONVERSION(VAE_TRT_CONVERSION_BASE):
                 width_opt,
                 width_opt,
                 width_opt,
+                batch_size,
+                batch_size,
+                batch_size,
                 is_static=True,
             )
         return ()
