@@ -222,7 +222,7 @@ def _find_existing_engine(profile_desc, model_name=None):
 
 
 def _list_real_engines(auto_dir):
-    """List real (non-symlink) engine files sorted oldest first."""
+    """List real (non-symlink) base engine files sorted oldest first."""
     entries = []
     total_real = 0
     if not os.path.isdir(auto_dir):
@@ -240,8 +240,66 @@ def _list_real_engines(auto_dir):
     return entries, total_real
 
 
-def _evict_engine(path, size):
+def _list_refit_cache_entries(auto_dir):
+    """List persisted refitted engines in .refit_cache/ sorted oldest first.
+
+    These are real files that occupy space under auto/, but they live in a
+    subdirectory, so a plain os.listdir(auto_dir) scan never sees them. They
+    must be counted in any disk-usage total, otherwise the accounting reports
+    only the base engines while the refit cache grows without bound (one
+    full-size engine per LoRA hash).
+    """
+    cache_dir = os.path.join(auto_dir, ".refit_cache")
+    entries = []
+    total = 0
+    if not os.path.isdir(cache_dir):
+        return entries, total
+    for f in os.listdir(cache_dir):
+        if not f.endswith(".engine"):
+            continue
+        path = os.path.join(cache_dir, f)
+        if os.path.islink(path):
+            continue
+        try:
+            size = os.path.getsize(path)
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        entries.append((mtime, path, size))
+        total += size
+    entries.sort()
+    return entries, total
+
+
+def _auto_dir_usage(auto_dir):
+    """Return (base_entries, refit_entries, total_bytes) for the auto dir.
+
+    total_bytes covers real base engines *and* the .refit_cache/ subdirectory.
+    Symlinked engines are excluded — they live elsewhere and are not ours to
+    reclaim.
+    """
+    base_entries, base_total = _list_real_engines(auto_dir)
+    refit_entries, refit_total = _list_refit_cache_entries(auto_dir)
+    log.debug(
+        "Auto disk: base=%d file(s)/%.2f GB, refit_cache=%d file(s)/%.2f GB, "
+        "total=%.2f GB",
+        len(base_entries),
+        base_total / 1024**3,
+        len(refit_entries),
+        refit_total / 1024**3,
+        (base_total + refit_total) / 1024**3,
+    )
+    return base_entries, refit_entries, base_total + refit_total
+
+
+def _normalize_protect(protect):
+    """Normalize a protect iterable into a set of absolute paths."""
+    return {os.path.abspath(p) for p in (protect or []) if p}
+
+
+def _evict_engine(path, size, protect=None):
     """Remove an engine file, its sidecars, and refit cache. Returns (filename, size_bytes)."""
+    protect = _normalize_protect(protect)
     log.info("Auto: FIFO evicting %s (%.1f MB)", path, size / (1024 * 1024))
     os.remove(path)
     for suffix in (".weight_map.json", ".meta.json"):
@@ -250,64 +308,169 @@ def _evict_engine(path, size):
             os.remove(sidecar)
     # Clean up persisted refit cache (legacy single-slot + hash-based multi-slot)
     cached = _refit_cache_path(path)
-    if os.path.isfile(cached):
+    if os.path.isfile(cached) and os.path.abspath(cached) not in protect:
         os.remove(cached)
     # Also remove hash-based cache files for this engine
     import glob as globmod
 
     stem = os.path.splitext(os.path.basename(path))[0]
     for f in globmod.glob(os.path.join(_refit_cache_dir(), f"{stem}_*.engine")):
+        if os.path.abspath(f) in protect:
+            continue
         log.info("Auto: evicting hash-cached refit %s", os.path.basename(f))
         os.remove(f)
     return (os.path.basename(path), size)
 
 
-def _purge_refit_cache():
-    """Remove all persisted refitted engines. Returns total bytes freed."""
-    cache_dir = _refit_cache_dir()
-    freed = 0
-    for f in os.listdir(cache_dir):
-        if not f.endswith(".engine"):
+def _evict_refit_entry(path, size):
+    """Remove a single persisted refitted engine. Returns (filename, size_bytes)."""
+    log.info(
+        "Auto: evicting refit cache entry %s (%.1f MB)",
+        os.path.basename(path),
+        size / (1024 * 1024),
+    )
+    os.remove(path)
+    return (os.path.basename(path), size)
+
+
+def _fifo_evict_max_usage(auto_dir, max_bytes, estimated_new_bytes=0, protect=None):
+    """Evict until auto/ (base engines + refit cache) fits under max_bytes.
+
+    Oldest-first, refit cache before base engines: a refit cache entry costs
+    seconds to regenerate, a base engine costs 5-10 minutes to rebuild.
+    Paths in `protect` are never evicted — they are the engine/cache files the
+    current execution is about to use.
+
+    Returns list of (filename, size_bytes).
+    """
+    protect = _normalize_protect(protect)
+    base_entries, refit_entries, total = _auto_dir_usage(auto_dir)
+    log.info(
+        "Auto disk: max_disk_usage check — usage %.2f GB + incoming %.2f GB "
+        "vs limit %.2f GB",
+        total / 1024**3,
+        estimated_new_bytes / 1024**3,
+        max_bytes / 1024**3,
+    )
+    if total + estimated_new_bytes <= max_bytes:
+        log.debug("Auto disk: under limit, nothing to evict")
+        return []
+
+    evicted = []
+    # Refit cache is expendable — evict it oldest-first before touching bases
+    for _mtime, path, size in refit_entries:
+        if total + estimated_new_bytes <= max_bytes:
+            break
+        if os.path.abspath(path) in protect:
+            log.debug(
+                "Auto disk: keeping in-use refit entry %s", os.path.basename(path)
+            )
             continue
-        path = os.path.join(cache_dir, f)
-        size = os.path.getsize(path)
-        log.info("Auto: purging refit cache %s (%.1f MB)", f, size / (1024 * 1024))
-        os.remove(path)
-        freed += size
-    return freed
-
-
-def _fifo_evict_max_usage(auto_dir, max_bytes, estimated_new_bytes=0):
-    """Evict refit cache first, then oldest base engines until under max_bytes. Returns list of (filename, size_bytes)."""
-    # Refit cache is expendable — purge it first
-    entries, total_real = _list_real_engines(auto_dir)
-    if total_real + estimated_new_bytes > max_bytes:
-        _purge_refit_cache()
-    evicted = []
-    for _mtime, path, size in entries:
-        if total_real + estimated_new_bytes <= max_bytes:
+        evicted.append(_evict_refit_entry(path, size))
+        total -= size
+    for _mtime, path, size in base_entries:
+        if total + estimated_new_bytes <= max_bytes:
             break
-        evicted.append(_evict_engine(path, size))
-        total_real -= size
+        if os.path.abspath(path) in protect:
+            log.debug("Auto disk: keeping in-use engine %s", os.path.basename(path))
+            continue
+        evicted.append(_evict_engine(path, size, protect=protect))
+        total -= size
+
+    if total + estimated_new_bytes > max_bytes:
+        log.warning(
+            "Auto disk: still %.2f GB over the %.2f GB limit after evicting %d "
+            "file(s) — the remainder is in use by this execution or symlinked",
+            (total + estimated_new_bytes - max_bytes) / 1024**3,
+            max_bytes / 1024**3,
+            len(evicted),
+        )
+    else:
+        log.info(
+            "Auto disk: evicted %d file(s), usage now %.2f GB",
+            len(evicted),
+            total / 1024**3,
+        )
     return evicted
 
 
-def _fifo_evict_min_free(auto_dir, min_free_bytes, estimated_new_bytes=0):
-    """Evict refit cache first, then oldest base engines until drive has min_free_bytes free. Returns list of (filename, size_bytes)."""
-    # Refit cache is expendable — purge it first
-    stat = os.statvfs(auto_dir)
-    free = stat.f_bavail * stat.f_frsize
-    if free - estimated_new_bytes < min_free_bytes:
-        _purge_refit_cache()
-    entries, _ = _list_real_engines(auto_dir)
-    evicted = []
-    for _mtime, path, size in entries:
+def _fifo_evict_min_free(auto_dir, min_free_bytes, estimated_new_bytes=0, protect=None):
+    """Evict oldest-first until the auto/ drive has min_free_bytes free.
+
+    Refit cache entries go before base engines (cheap vs expensive to
+    regenerate). Paths in `protect` are never evicted.
+
+    Returns list of (filename, size_bytes).
+    """
+    protect = _normalize_protect(protect)
+
+    def _free_bytes():
         stat = os.statvfs(auto_dir)
-        free = stat.f_bavail * stat.f_frsize
-        if free - estimated_new_bytes >= min_free_bytes:
+        return stat.f_bavail * stat.f_frsize
+
+    free = _free_bytes()
+    log.info(
+        "Auto disk: min_disk_free check — free %.2f GB - incoming %.2f GB "
+        "vs minimum %.2f GB",
+        free / 1024**3,
+        estimated_new_bytes / 1024**3,
+        min_free_bytes / 1024**3,
+    )
+    if free - estimated_new_bytes >= min_free_bytes:
+        log.debug("Auto disk: enough free space, nothing to evict")
+        return []
+
+    base_entries, refit_entries, _total = _auto_dir_usage(auto_dir)
+    candidates = [(m, p, s, True) for m, p, s in refit_entries] + [
+        (m, p, s, False) for m, p, s in base_entries
+    ]
+    evicted = []
+    for _mtime, path, size, is_refit in candidates:
+        if _free_bytes() - estimated_new_bytes >= min_free_bytes:
             break
-        evicted.append(_evict_engine(path, size))
+        if os.path.abspath(path) in protect:
+            log.debug("Auto disk: keeping in-use file %s", os.path.basename(path))
+            continue
+        if is_refit:
+            evicted.append(_evict_refit_entry(path, size))
+        else:
+            evicted.append(_evict_engine(path, size, protect=protect))
+
+    if _free_bytes() - estimated_new_bytes < min_free_bytes:
+        log.warning(
+            "Auto disk: free space still below the %.2f GB minimum after "
+            "evicting %d file(s)",
+            min_free_bytes / 1024**3,
+            len(evicted),
+        )
+    else:
+        log.info(
+            "Auto disk: evicted %d file(s), free now %.2f GB",
+            len(evicted),
+            _free_bytes() / 1024**3,
+        )
     return evicted
+
+
+def _enforce_disk_management(
+    auto_dir, mode, threshold_gb, estimated_new_bytes=0, protect=None
+):
+    """Run the configured disk-management policy. Returns list of (filename, size_bytes)."""
+    if mode == "max_disk_usage":
+        return _fifo_evict_max_usage(
+            auto_dir,
+            int(threshold_gb * 1024**3),
+            estimated_new_bytes=estimated_new_bytes,
+            protect=protect,
+        )
+    if mode == "min_disk_free":
+        return _fifo_evict_min_free(
+            auto_dir,
+            int(threshold_gb * 1024**3),
+            estimated_new_bytes=estimated_new_bytes,
+            protect=protect,
+        )
+    return []
 
 
 def _do_refit(engine, unet_path, source_model, model_type):
@@ -617,12 +780,15 @@ class TensorRTLoaderAuto:
                     {
                         "default": "disabled",
                         "tooltip": "Disk management for models/tensorrt/auto/. "
-                        "Eviction order: refit cache (expendable, ~13s to rebuild) is purged first, "
-                        "then oldest base engines (expensive, 5-10 min to rebuild) by FIFO. "
+                        "Checked on every execution — including plain cache hits — and again "
+                        "before an engine is built or a refitted engine is written. "
+                        "Eviction order: .refit_cache/ entries (expendable, ~13s to regenerate) "
+                        "oldest-first, then oldest base engines (expensive, 5-10 min to rebuild). "
                         "'disabled': no eviction. "
                         "'max_disk_usage': evict when auto/ total size exceeds threshold_gb. "
                         "'min_disk_free': evict when free space on the auto/ drive drops below threshold_gb. "
-                        "Only real files are evicted — symlinked engines are excluded.",
+                        "Only real files are evicted — symlinked engines and the files the current "
+                        "execution is using are always kept.",
                     },
                 ),
                 "threshold_gb": (
@@ -633,7 +799,12 @@ class TensorRTLoaderAuto:
                         "max": 1000.0,
                         "step": 1.0,
                         "tooltip": "Threshold in GB. "
-                        "For 'max_disk_usage': maximum total size of models/tensorrt/auto/. "
+                        "For 'max_disk_usage': maximum total size of models/tensorrt/auto/, counting "
+                        "base engines AND the hidden .refit_cache/ subdir (one full-size engine per "
+                        "LoRA combination, so it dominates the total once LoRAs are in play). "
+                        "Eviction prunes down to below this figure, leaving headroom for the engine "
+                        "about to be written — set it above the size of a single engine (~5 GB for "
+                        "SDXL) or nothing can be kept. "
                         "For 'min_disk_free': minimum free space on the drive where auto/ lives. "
                         "Only real files count — symlinked engines are excluded from size calculation and eviction.",
                     },
@@ -830,19 +1001,13 @@ class TensorRTLoaderAuto:
             _build_eta = trt_timing.estimate_eta("build_unet", model_type, _build_res)
             _send_trt_progress("building", elapsed_s=0, eta_s=_build_eta)
 
-            evicted = []
-            if disk_management == "max_disk_usage":
-                evicted = _fifo_evict_max_usage(
-                    auto_dir,
-                    int(threshold_gb * 1024**3),
-                    estimated_new_bytes=2 * 1024**3,
-                )
-            elif disk_management == "min_disk_free":
-                evicted = _fifo_evict_min_free(
-                    auto_dir,
-                    int(threshold_gb * 1024**3),
-                    estimated_new_bytes=2 * 1024**3,
-                )
+            evicted = _enforce_disk_management(
+                auto_dir,
+                disk_management,
+                threshold_gb,
+                estimated_new_bytes=2 * 1024**3,
+                protect=(engine_path,),
+            )
             if evicted:
                 PromptServer.instance.send_sync(
                     "trt_disk_eviction",
@@ -916,9 +1081,13 @@ class TensorRTLoaderAuto:
             }
             if disk_management != "disabled":
                 auto_models = _collect_auto_models_info(auto_dir)
-                info["current_disk_usage_bytes"] = sum(
-                    m["disk_size_bytes"] for m in auto_models
+                _refit_bytes = _list_refit_cache_entries(auto_dir)[1]
+                # Must match what the eviction policy measures: base engines
+                # plus the .refit_cache/ subdirectory.
+                info["current_disk_usage_bytes"] = (
+                    sum(m["disk_size_bytes"] for m in auto_models) + _refit_bytes
                 )
+                info["refit_cache_bytes"] = _refit_bytes
                 info["auto_models"] = auto_models
             return json.dumps(info, indent=2)
 
@@ -936,6 +1105,18 @@ class TensorRTLoaderAuto:
         if lora_hash is not None:
             _id_h.update(lora_hash.encode())
         model_hash = _id_h.hexdigest()[:16]
+
+        # Enforce the disk policy on every execution, not only when something
+        # new is written. A workflow that keeps hitting existing engines never
+        # reaches the build or refit-persist paths, so without this the auto
+        # dir grows past the threshold and is never trimmed.
+        if disk_management != "disabled":
+            _protect = [engine_path]
+            if lora_hash is not None:
+                _protect.append(_rc.disk_cache_path(engine_path, lora_hash))
+            _enforce_disk_management(
+                auto_dir, disk_management, threshold_gb, protect=_protect
+            )
 
         log.info(
             f"Auto: cache check — has_patches={has_patches}, "
@@ -1105,16 +1286,15 @@ class TensorRTLoaderAuto:
 
             # Persist refitted engine with hash-based filename
             # Ensure disk space before writing (~5GB for SDXL)
-            estimated_size = 5 * 1024**3
-            if disk_management == "max_disk_usage":
-                _fifo_evict_max_usage(
-                    auto_dir, int(threshold_gb * 1024**3), estimated_size
-                )
-            elif disk_management == "min_disk_free":
-                _fifo_evict_min_free(
-                    auto_dir, int(threshold_gb * 1024**3), estimated_size
-                )
             cached_path = _refit_cache_path(engine_path, lora_hash)
+            estimated_size = 5 * 1024**3
+            _enforce_disk_management(
+                auto_dir,
+                disk_management,
+                threshold_gb,
+                estimated_new_bytes=estimated_size,
+                protect=(engine_path, cached_path),
+            )
             try:
                 data = unet.engine.serialize()
                 with open(cached_path, "wb") as f:
